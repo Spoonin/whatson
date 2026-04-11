@@ -5,10 +5,12 @@
  * declared in SKILL.md. OpenClaw discovers and calls these by name.
  */
 
-import { processMessage } from "./wal.js";
+import { processMessage, processMessageWithUrls, processMessageLlm, processMessageWithUrlsLlm } from "./wal.js";
+import { extractUrls } from "./url-fetch.js";
 import { insertFact, searchFacts, type Fact, type SourceType, type Confidence } from "./storage.js";
 import { runConsolidation } from "./consolidation.js";
 import { retrieve, getStatus } from "./retrieval.js";
+import type { ExtractedFact } from "./llm-extract.js";
 
 // Confidence defaults per entry type
 const CONFIDENCE_MAP: Record<string, Confidence> = {
@@ -21,43 +23,100 @@ const CONFIDENCE_MAP: Record<string, Confidence> = {
 
 // ── Tool: wal_append ──────────────────────────────────────────────────────────
 
+/** Store an ExtractedFact into SQLite and return the result entry */
+async function storeFact(
+  fact: ExtractedFact,
+  source: string,
+  timestamp: string,
+  rawMessage: string,
+  messageId: string | null,
+  sourceUrl: string | null,
+  sourceFile: string | null,
+): Promise<{ type: string; text: string; id: number; tags: string[]; confidence: string; source_url?: string }> {
+  const id = await insertFact({
+    content:       fact.text,
+    source,
+    source_type:   fact.type as SourceType,
+    confidence:    fact.confidence ?? (CONFIDENCE_MAP[fact.type] ?? "medium"),
+    valid_from:    timestamp,
+    valid_to:      null,
+    superseded_by: null,
+    tags:          fact.tags ?? [],
+    raw_message:   rawMessage,
+    message_id:    messageId,
+    source_url:    sourceUrl,
+    source_file:   sourceFile,
+  });
+  return { type: fact.type, text: fact.text, id, tags: fact.tags, confidence: fact.confidence, ...(sourceUrl ? { source_url: sourceUrl } : {}) };
+}
+
 export async function wal_append(args: {
   message: string;
   source: string;
   timestamp: string;
-}): Promise<{ entries: Array<{ type: string; text: string; id: number }> }> {
-  const entries = processMessage(args.message, args.source, args.timestamp);
+  message_id?: string;
+  source_url?: string;
+  source_file?: string;
+}): Promise<{ entries: Array<{ type: string; text: string; id: number; tags?: string[]; confidence?: string; source_url?: string }>; method: string }> {
+  const urls = extractUrls(args.message);
+  const result: Array<{ type: string; text: string; id: number; tags?: string[]; confidence?: string; source_url?: string }> = [];
+  let method = "llm";
 
-  const result = [];
-  for (const entry of entries) {
-    const id = insertFact({
-      content:       entry.text,
-      source:        entry.source,
-      source_type:   entry.type as SourceType,
-      confidence:    CONFIDENCE_MAP[entry.type] ?? "medium",
-      valid_from:    entry.timestamp,
-      valid_to:      null,
-      superseded_by: null,
-      tags:          [],
-      raw_message:   args.message,
-    });
-    result.push({ type: entry.type, text: entry.text, id });
+  if (urls.length === 0) {
+    // Plain text — use LLM extraction (falls back to regex internally)
+    const extraction = await processMessageLlm(args.message, args.source, args.timestamp);
+    method = extraction.method;
+
+    for (const fact of extraction.facts) {
+      const entry = await storeFact(
+        fact, args.source, args.timestamp, args.message,
+        args.message_id ?? null, null, args.source_file ?? null,
+      );
+      result.push(entry);
+    }
+  } else {
+    // Message contains URLs — use LLM extraction for text + each URL
+    const { textResult, urlResults } = await processMessageWithUrlsLlm(
+      args.message, args.source, args.timestamp
+    );
+    method = textResult.method;
+
+    for (const fact of textResult.facts) {
+      const entry = await storeFact(
+        fact, args.source, args.timestamp, args.message,
+        args.message_id ?? null, null, null,
+      );
+      result.push(entry);
+    }
+
+    for (const { url, result: urlResult } of urlResults) {
+      for (const fact of urlResult.facts) {
+        const entry = await storeFact(
+          fact, `web:${url}`, args.timestamp, args.message,
+          args.message_id ?? null, url, null,
+        );
+        result.push(entry);
+      }
+    }
   }
 
-  return { entries: result };
+  return { entries: result, method };
 }
 
 // ── Tool: storage_insert ──────────────────────────────────────────────────────
 
 export async function storage_insert(args: {
-  content:     string;
-  source:      string;
-  source_type: string;
-  confidence:  string;
-  tags:        string[];
-  raw_message: string;
+  content:      string;
+  source:       string;
+  source_type:  string;
+  confidence:   string;
+  tags:         string[];
+  raw_message:  string;
+  message_id?:  string;
+  source_url?:  string;
+  source_file?: string;
 }): Promise<{ id: number }> {
-  const id = insertFact({
+  const id = await insertFact({
     content:       args.content,
     source:        args.source,
     source_type:   args.source_type as SourceType,
@@ -67,6 +126,9 @@ export async function storage_insert(args: {
     superseded_by: null,
     tags:          args.tags ?? [],
     raw_message:   args.raw_message ?? null,
+    message_id:    args.message_id ?? null,
+    source_url:    args.source_url ?? null,
+    source_file:   args.source_file ?? null,
   });
   return { id };
 }
@@ -80,7 +142,7 @@ export async function storage_query(args: {
 }): Promise<{
   facts: Array<Pick<Fact, "id" | "content" | "source" | "confidence" | "created_at">>;
 }> {
-  const results = searchFacts(args.keyword ?? "", args.tags ?? [], args.limit ?? 20);
+  const results = await searchFacts(args.keyword ?? "", args.tags ?? [], args.limit ?? 20);
   return {
     facts: results.map((f) => ({
       id:         f.id,
@@ -107,5 +169,5 @@ export async function consolidate(): Promise<{
 // ── Tool: get_status ──────────────────────────────────────────────────────────
 
 export async function get_status(): Promise<{ status: string }> {
-  return { status: getStatus() };
+  return { status: await getStatus() };
 }

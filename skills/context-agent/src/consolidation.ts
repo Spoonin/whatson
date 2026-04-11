@@ -44,10 +44,10 @@ interface OrientSnapshot {
   topicGroups: Record<string, number>;
 }
 
-function orient(): OrientSnapshot {
-  const counts = getFactCount();
-  const facts = getActiveFacts();
-  const lastConsolidation = getLastConsolidation();
+async function orient(): Promise<OrientSnapshot> {
+  const counts = await getFactCount();
+  const facts = await getActiveFacts();
+  const lastConsolidation = await getLastConsolidation();
 
   // Group by first tag (rough topic)
   const topicGroups: Record<string, number> = {};
@@ -71,9 +71,9 @@ interface GatherResult {
   sinceDate: string;
 }
 
-function gatherSignal(snapshot: OrientSnapshot): GatherResult {
+async function gatherSignal(snapshot: OrientSnapshot): Promise<GatherResult> {
   const sinceDate = snapshot.lastConsolidation ?? new Date(0).toISOString();
-  const facts = getActiveFacts();
+  const facts = await getActiveFacts();
 
   // Priority: corrections > decisions > facts > opinions
   const priorityOrder: Record<string, number> = {
@@ -97,7 +97,7 @@ interface ConsolidateResult {
   contradictions: number;
 }
 
-function consolidate(newFacts: Fact[], allFacts: Fact[]): ConsolidateResult {
+async function consolidate(newFacts: Fact[], allFacts: Fact[]): Promise<ConsolidateResult> {
   let merged = 0;
   let contradictions = 0;
 
@@ -121,8 +121,8 @@ function consolidate(newFacts: Fact[], allFacts: Fact[]): ConsolidateResult {
             ? [fact, other]
             : [other, fact];
 
-        expireFact(expire.id!, keep.id!);
-        insertRelation({
+        await expireFact(expire.id!, keep.id!);
+        await insertRelation({
           fact_id: keep.id!,
           related_fact_id: expire.id!,
           relation_type: "supersedes",
@@ -138,8 +138,8 @@ function consolidate(newFacts: Fact[], allFacts: Fact[]): ConsolidateResult {
         other.source_type !== "correction" &&
         contentOverlaps(fact.content, other.content)
       ) {
-        expireFact(other.id!, fact.id!);
-        insertRelation({
+        await expireFact(other.id!, fact.id!);
+        await insertRelation({
           fact_id: fact.id!,
           related_fact_id: other.id!,
           relation_type: "contradicts",
@@ -168,31 +168,31 @@ function contentOverlaps(a: string, b: string): boolean {
 
 // ── Phase 4: Prune & Index ────────────────────────────────────────────────────
 
-function pruneAndIndex(snapshot: OrientSnapshot): { invalidated: number } {
-  const facts = getActiveFacts();
+async function pruneAndIndex(snapshot: OrientSnapshot): Promise<{ invalidated: number }> {
+  const facts = await getActiveFacts();
   const cutoff = new Date(Date.now() - STALE_DAYS * 86400 * 1000).toISOString();
   let invalidated = 0;
 
   for (const f of facts) {
     if (f.valid_from < cutoff && f.confidence === "low") {
-      expireFact(f.id!);
+      await expireFact(f.id!);
       invalidated++;
     }
   }
 
   // Refresh counts after pruning so the index reflects the current state
-  const freshCounts = getFactCount();
+  const freshCounts = await getFactCount();
   const freshSnapshot: OrientSnapshot = {
     ...snapshot,
     totalActive: freshCounts.active,
     totalExpired: freshCounts.expired,
   };
-  updateIndex(freshSnapshot);
+  await updateIndex(freshSnapshot);
   return { invalidated };
 }
 
-function updateIndex(snapshot: OrientSnapshot): void {
-  const facts = getActiveFacts();
+async function updateIndex(snapshot: OrientSnapshot): Promise<void> {
+  const facts = await getActiveFacts();
   const now = new Date().toISOString();
 
   const lines: string[] = [
@@ -253,8 +253,8 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
 
   // Phase 1
   const t1 = Date.now();
-  const snapshot = orient();
-  logConsolidationPhase({
+  const snapshot = await orient();
+  await logConsolidationPhase({
     run_at: runAt,
     phase: "orient",
     facts_processed: snapshot.totalActive,
@@ -267,8 +267,8 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
 
   // Phase 2
   const t2 = Date.now();
-  const { newFacts, sinceDate } = gatherSignal(snapshot);
-  logConsolidationPhase({
+  const { newFacts, sinceDate } = await gatherSignal(snapshot);
+  await logConsolidationPhase({
     run_at: runAt,
     phase: "gather",
     facts_processed: newFacts.length,
@@ -281,9 +281,9 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
 
   // Phase 3
   const t3 = Date.now();
-  const allFacts = getActiveFacts();
-  const { merged, contradictions } = consolidate(newFacts, allFacts);
-  logConsolidationPhase({
+  const allFacts = await getActiveFacts();
+  const { merged, contradictions } = await consolidate(newFacts, allFacts);
+  await logConsolidationPhase({
     run_at: runAt,
     phase: "consolidate",
     facts_processed: newFacts.length,
@@ -296,8 +296,8 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
 
   // Phase 4
   const t4 = Date.now();
-  const { invalidated } = pruneAndIndex(snapshot);
-  logConsolidationPhase({
+  const { invalidated } = await pruneAndIndex(snapshot);
+  await logConsolidationPhase({
     run_at: runAt,
     phase: "prune",
     facts_processed: allFacts.length,

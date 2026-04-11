@@ -73,7 +73,7 @@ function formatAttribution(fact: Fact): string {
   return `(source: ${fact.source}, ${date})`;
 }
 
-// ── Context block builder ─────────────────────────────────────────────────────
+// ── Context block builder ────────────────────────────────────────────────────
 
 function buildContextBlock(facts: AttributedFact[]): { block: string; truncated: boolean } {
   const lines: string[] = [
@@ -99,7 +99,7 @@ function buildContextBlock(facts: AttributedFact[]): { block: string; truncated:
 
 // ── Main retrieval function ───────────────────────────────────────────────────
 
-export function retrieve(question: string, limit = 20): RetrievalResult {
+export async function retrieve(question: string, limit = 20): Promise<RetrievalResult> {
   const { keywords, tags } = extractKeywords(question);
 
   // Try each keyword independently and merge results
@@ -107,7 +107,7 @@ export function retrieve(question: string, limit = 20): RetrievalResult {
   const factMap = new Map<number, Fact>();
 
   for (const kw of keywords.slice(0, 5)) {
-    const results = searchFacts(kw, tags, limit);
+    const results = await searchFacts(kw, tags, limit);
     for (const f of results) {
       if (!seen.has(f.id!)) {
         seen.add(f.id!);
@@ -118,7 +118,7 @@ export function retrieve(question: string, limit = 20): RetrievalResult {
 
   // If no keyword matched, search by tags only
   if (factMap.size === 0 && tags.length > 0) {
-    const results = searchFacts("", tags, limit);
+    const results = await searchFacts("", tags, limit);
     for (const f of results) {
       factMap.set(f.id!, f);
     }
@@ -126,7 +126,7 @@ export function retrieve(question: string, limit = 20): RetrievalResult {
 
   // Final fallback: no keywords and no tags (e.g. bare "?" message) — return recent active facts
   if (factMap.size === 0) {
-    const results = searchFacts("", [], limit);
+    const results = await searchFacts("", [], limit);
     for (const f of results) {
       factMap.set(f.id!, f);
     }
@@ -169,9 +169,9 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_STATE_PATH = path.resolve(__dirname, "../data/SESSION-STATE.md");
 
-export function getStatus(): string {
-  const counts = getFactCount();
-  const lastConsolidation = getLastConsolidation() ?? "never";
+export async function getStatus(): Promise<string> {
+  const counts = await getFactCount();
+  const lastConsolidation = (await getLastConsolidation()) ?? "never";
 
   let openQuestions = 0;
   if (fs.existsSync(SESSION_STATE_PATH)) {

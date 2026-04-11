@@ -8,6 +8,8 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { extractUrls, stripUrls, fetchPageText } from "./url-fetch.js";
+import { extractWithLlm, type ExtractedFact, type ExtractionResult } from "./llm-extract.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, "../data");
@@ -110,10 +112,31 @@ export function appendToWal(entries: WalEntry[]): void {
   fs.writeFileSync(SESSION_STATE_PATH, content, "utf-8");
 }
 
+// ── URL section in SESSION-STATE.md ──────────────────────────────────────────
+
+function appendUrlToWal(url: string, description: string, timestamp: string): void {
+  ensureSessionFile();
+  let content = fs.readFileSync(SESSION_STATE_PATH, "utf-8");
+
+  // Ensure URLs section exists
+  if (!content.includes("## URLs")) {
+    const openQIdx = content.indexOf("## Open Questions");
+    if (openQIdx !== -1) {
+      content = content.slice(0, openQIdx) + "## URLs\n\n" + content.slice(openQIdx);
+    } else {
+      content += "\n## URLs\n";
+    }
+  }
+
+  const line = `[${timestamp}] ${url}\n  Description: ${description.slice(0, 500)}`;
+  content = appendToSection(content, "URLs", line);
+  fs.writeFileSync(SESSION_STATE_PATH, content, "utf-8");
+}
+
 // ── Main export ───────────────────────────────────────────────────────────────
 
 /**
- * Process a raw incoming message:
+ * Process a raw incoming message (text only, synchronous):
  * 1. Extract WAL entries
  * 2. Append to SESSION-STATE.md
  * Returns the extracted entries for further processing (e.g. storage).
@@ -126,4 +149,140 @@ export function processMessage(
   const entries = extractEntries(message, source, timestamp);
   appendToWal(entries);
   return entries;
+}
+
+/**
+ * Process a message that may contain URLs (regex-only):
+ * 1. Detect and fetch each URL
+ * 2. Extract WAL entries from plain text + each fetched page
+ * 3. Append everything to SESSION-STATE.md
+ * Returns all entries with source_url metadata.
+ */
+export async function processMessageWithUrls(
+  message: string,
+  source: string,
+  timestamp = new Date().toISOString()
+): Promise<{ textEntries: WalEntry[]; urlEntries: Array<{ url: string; entries: WalEntry[]; description: string }> }> {
+  const urls = extractUrls(message);
+  const plainText = stripUrls(message);
+
+  // Process plain text portion
+  const textEntries = plainText.length > 0
+    ? extractEntries(plainText, source, timestamp)
+    : [];
+  appendToWal(textEntries);
+
+  // Fetch and process each URL
+  const urlEntries: Array<{ url: string; entries: WalEntry[]; description: string }> = [];
+  for (const url of urls) {
+    const pageText = await fetchPageText(url);
+    if (pageText.startsWith("[fetch error:")) {
+      urlEntries.push({ url, entries: [], description: pageText });
+      continue;
+    }
+
+    // Take first ~4000 chars for extraction (avoid overwhelming the WAL)
+    const truncated = pageText.slice(0, 4000);
+    const entries = extractEntries(truncated, `web:${url}`, timestamp);
+    appendToWal(entries);
+    appendUrlToWal(url, truncated.slice(0, 500), timestamp);
+    urlEntries.push({ url, entries, description: truncated.slice(0, 500) });
+  }
+
+  return { textEntries, urlEntries };
+}
+
+// ── LLM-based extraction (primary path) ─────────────────────────────────────
+
+/** Convert LLM-extracted facts to WalEntry format for SESSION-STATE.md */
+function llmFactsToWalEntries(facts: ExtractedFact[], source: string, timestamp: string): WalEntry[] {
+  return facts.map((f) => ({
+    type: (f.type === "summary" || f.type === "opinion" ? "fact" : f.type) as EntryType,
+    text: f.text,
+    source,
+    timestamp,
+  }));
+}
+
+/**
+ * Process a message using LLM-based extraction (with regex fallback):
+ * 1. Send text to Anthropic for classification
+ * 2. If LLM fails, fall back to regex extraction
+ * 3. Append to SESSION-STATE.md
+ * Returns extracted facts with full metadata (tags, confidence from LLM).
+ */
+export async function processMessageLlm(
+  message: string,
+  source: string,
+  timestamp = new Date().toISOString()
+): Promise<ExtractionResult> {
+  const result = await extractWithLlm(message, source);
+
+  if (result.method === "regex" || result.facts.length === 0) {
+    // LLM unavailable or returned nothing — fall back to regex
+    const regexEntries = extractEntries(message, source, timestamp);
+    appendToWal(regexEntries);
+    return {
+      facts: regexEntries.map((e) => ({
+        type: e.type as ExtractedFact["type"],
+        text: e.text,
+        tags: [],
+        confidence: e.type === "decision" || e.type === "correction" ? "high" : "medium",
+      })),
+      method: "regex",
+    };
+  }
+
+  // LLM succeeded — convert to WAL entries and write
+  const walEntries = llmFactsToWalEntries(result.facts, source, timestamp);
+  appendToWal(walEntries);
+
+  return result;
+}
+
+/**
+ * Process a message with URLs using LLM-based extraction:
+ * 1. Detect and fetch each URL
+ * 2. Use LLM to extract facts from plain text + each fetched page
+ * 3. Append everything to SESSION-STATE.md
+ */
+export async function processMessageWithUrlsLlm(
+  message: string,
+  source: string,
+  timestamp = new Date().toISOString()
+): Promise<{
+  textResult: ExtractionResult;
+  urlResults: Array<{ url: string; result: ExtractionResult; description: string }>;
+}> {
+  const urls = extractUrls(message);
+  const plainText = stripUrls(message);
+
+  // Process plain text with LLM
+  const textResult = plainText.length > 0
+    ? await processMessageLlm(plainText, source, timestamp)
+    : { facts: [], method: "llm" as const };
+
+  // Fetch and process each URL with LLM
+  const urlResults: Array<{ url: string; result: ExtractionResult; description: string }> = [];
+  for (const url of urls) {
+    const pageText = await fetchPageText(url);
+    if (pageText.startsWith("[fetch error:")) {
+      urlResults.push({ url, result: { facts: [], method: "llm" }, description: pageText });
+      continue;
+    }
+
+    const truncated = pageText.slice(0, 6000);
+    const result = await extractWithLlm(truncated, `web:${url}`);
+
+    // Write to WAL
+    if (result.facts.length > 0) {
+      const walEntries = llmFactsToWalEntries(result.facts, `web:${url}`, timestamp);
+      appendToWal(walEntries);
+    }
+    appendUrlToWal(url, truncated.slice(0, 500), timestamp);
+
+    urlResults.push({ url, result, description: truncated.slice(0, 500) });
+  }
+
+  return { textResult, urlResults };
 }

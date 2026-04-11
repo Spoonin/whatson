@@ -5,70 +5,64 @@ description: "Collects, structures, and consolidates knowledge from conversation
 
 # context-agent
 
-Context Agent collects, structures, and consolidates knowledge from conversations and documents. It maintains a temporal knowledge graph with source attribution and conflict resolution.
+Context Agent collects, structures, and consolidates knowledge from conversations and documents.
+It persists facts in a SQLite database via MCP tools prefixed with `context-agent__`.
 
-## Tools
+## CRITICAL: Mandatory tool calls
 
-### wal_append
-Append extracted facts/decisions/corrections from a message to the Write-Ahead Log.
+**You MUST call `context-agent__wal_append` for EVERY user message that contains substantive content.**
+This is not optional. Do NOT summarize, paraphrase, or role-play storing facts.
+You MUST actually invoke the tool. The tool extracts facts using an LLM classifier and stores them in SQLite.
 
-**Input:**
-- `message` (string) — raw incoming message text
-- `source` (string) — origin: `telegram:@username`, `doc:filename`, etc.
-- `timestamp` (string, ISO 8601) — when the message arrived
+A message is "substantive" if it contains any of: decisions, facts, opinions, corrections, technical details, project context, or URLs.
+Skip only: bare greetings ("hi", "thanks"), single emoji, or meta-questions about the bot itself.
 
-**Output:** list of extracted entries written to SESSION-STATE.md
+## Available MCP tools
 
----
+### context-agent__wal_append
+Extract and store facts from a message. **Call this on every substantive user message.**
 
-### storage_insert
-Persist a structured fact into the SQLite knowledge base.
+Parameters:
+- `message` (required): The full verbatim user message text
+- `source` (required): Origin, e.g. `telegram:@username`
+- `timestamp` (required): ISO 8601 timestamp of the message
+- `message_id` (optional): Unique message ID
+- `source_url` (optional): URL if the message was fetched from a page
+- `source_file` (optional): File path if extracted from a document
 
-**Input:**
-- `content` (string) — fact text
-- `source` (string) — origin identifier
-- `source_type` (enum: `decision | fact | correction | opinion`)
-- `confidence` (enum: `low | medium | high`)
-- `tags` (string[]) — topic tags
-- `raw_message` (string) — verbatim original
+### context-agent__storage_query
+Search the knowledge base by keyword or tags. Use when the user asks about previously recorded information.
 
-**Output:** inserted fact `id`
+Parameters:
+- `keyword` (optional): Search term matched against fact content
+- `tags` (optional): Array of topic tags to filter by
+- `limit` (optional): Max results (default 20)
 
----
+### context-agent__get_status
+Return health snapshot: total facts, last consolidation, open questions. Use on `/status` or when user asks about the knowledge base state.
 
-### storage_query
-Query current (non-expired) facts by keyword or tag.
+### context-agent__consolidate
+Run the 4-phase consolidation loop (dedup, contradiction resolution, pruning, index rebuild). Use on `/consolidate`.
 
-**Input:**
-- `keyword` (string, optional)
-- `tags` (string[], optional)
-- `limit` (number, default 20)
+### context-agent__storage_insert
+Directly insert a pre-classified fact. Use when you want to store a fact with specific type/confidence/tags without running extraction.
 
-**Output:** array of matching facts with id, content, source, confidence, created_at
+Parameters:
+- `content` (required): Fact text
+- `source` (required): Origin identifier
+- `source_type` (required): One of: decision, fact, correction, opinion, question, summary
+- `confidence` (required): One of: low, medium, high
+- `tags` (required): Array of topic tags
+- `raw_message` (required): Original verbatim message
 
----
+## Response pattern
 
-### consolidate
-Run the 4-phase consolidation loop.
+1. **First**: Call `context-agent__wal_append` with the user's message
+2. **Then**: Read the tool result to see what facts were extracted
+3. **Finally**: Respond to the user, mentioning what was recorded and the current fact count
 
-**Input:** none (reads from DB and session logs)
+## Slash commands
 
-**Output:** consolidation summary — facts merged, contradictions found, INDEX.md updated
-
----
-
-### get_status
-Return agent health snapshot.
-
-**Output:**
-- total facts (active / expired)
-- last consolidation timestamp
-- open questions from SESSION-STATE.md
-- session fact count
-
-## Slash Commands
-
-Registered with OpenClaw runtime:
-- `/consolidate` → invokes `consolidate` tool
-- `/facts [keyword]` → invokes `storage_query`
-- `/status` → invokes `get_status`
+- `/consolidate` → call `context-agent__consolidate`
+- `/facts [keyword]` → call `context-agent__storage_query`
+- `/status` → call `context-agent__get_status`

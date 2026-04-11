@@ -12,17 +12,15 @@
     "migrate": "node dist/storage.js migrate"
   },
   "dependencies": {
-    "better-sqlite3": "^12.8.0"
+    "@anthropic-ai/sdk": "^0.88.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "sql.js": "^1.12.0",
+    "zod": "3.25.28"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
+    "@types/sql.js": "^1.4.9",
     "@types/node": "^20.11.5",
     "typescript": "^5.3.3",
     "vitest": "^4.1.4"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3"
-    ]
   }
 }
