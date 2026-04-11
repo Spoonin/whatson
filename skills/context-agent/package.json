@@ -1,0 +1,28 @@
+{
+  "name": "context-agent",
+  "version": "0.1.0",
+  "description": "Context Agent — temporal knowledge graph over OpenClaw",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "migrate": "node dist/storage.js migrate"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.11.5",
+    "typescript": "^5.3.3",
+    "vitest": "^4.1.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  }
+}

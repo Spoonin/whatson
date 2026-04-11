@@ -1,0 +1,25 @@
+services:
+  openclaw-gateway:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+    volumes:
+      - ./data/openclaw-config:/home/node/.openclaw
+      - ./skills:/home/node/.openclaw/workspace/skills
+      - ./AGENTS.md:/home/node/.openclaw/workspace/AGENTS.md:ro
+      - ./SOUL.md:/home/node/.openclaw/workspace/SOUL.md:ro
+      - ./data/context-data:/home/node/.openclaw/workspace/skills/context-agent/data
+
+  openclaw-cli:
+    image: ghcr.io/openclaw/openclaw:latest
+    entrypoint: ["node", "dist/index.js"]
+    profiles: ["cli"]
+    volumes:
+      - ./data/openclaw-config:/home/node/.openclaw
+
+volumes: {}
