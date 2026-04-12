@@ -19,6 +19,7 @@ import {
   insertDriftFinding,
   getDriftFindings,
   getUnansweredQuestions,
+  getFactsByIds,
   type Fact,
   type DriftFinding,
 } from "./storage.js";
@@ -272,4 +273,49 @@ export async function getDriftReport(): Promise<{
   const latestFindings = await getDriftFindings();
   const unansweredQuestions = await getUnansweredQuestions();
   return { latestFindings, unansweredQuestions };
+}
+
+/**
+ * Format drift findings as a human-readable summary, enriched with fact content.
+ * Used in the consolidation report and morning digest.
+ */
+export async function formatDriftSummary(
+  result: DriftAnalysisResult | { error: string } | { skipped: string }
+): Promise<string> {
+  if ("skipped" in result) return `Drift analysis: skipped (${result.skipped})`;
+  if ("error" in result) return `Drift analysis: error — ${result.error}`;
+
+  if (result.inconsistencies === 0) {
+    return `Drift analysis: ${result.factsAnalyzed} facts checked, all consistent`;
+  }
+
+  const findings = await getDriftFindings();
+  const inconsistent = findings.filter((f) => !f.consistent);
+  const factIds = inconsistent.map((f) => f.fact_id);
+  const facts = await getFactsByIds(factIds);
+  const factMap = new Map(facts.map((f) => [f.id!, f]));
+
+  const lines: string[] = [
+    `Drift analysis: ${result.inconsistencies} inconsistencies found (${result.factsAnalyzed} facts checked)`,
+  ];
+
+  for (const finding of inconsistent) {
+    const fact = factMap.get(finding.fact_id);
+    const label = fact ? fact.content.slice(0, 80) : `Fact #${finding.fact_id}`;
+    lines.push(`  - ${label}`);
+    if (finding.evidence) {
+      lines.push(`    Evidence: ${finding.evidence.slice(0, 120)}`);
+    }
+  }
+
+  const questions = findings.filter((f) => f.question && !f.addressed);
+  if (questions.length > 0) {
+    lines.push(``);
+    lines.push(`Open questions for stakeholders:`);
+    for (let i = 0; i < questions.length; i++) {
+      lines.push(`  ${i + 1}. ${questions[i].question!.slice(0, 150)}`);
+    }
+  }
+
+  return lines.join("\n");
 }

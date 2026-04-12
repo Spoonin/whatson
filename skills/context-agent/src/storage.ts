@@ -281,6 +281,17 @@ export async function getFact(id: number): Promise<Fact | null> {
   return row ? deserializeFact(row) : null;
 }
 
+export async function getFactsByIds(ids: number[]): Promise<Fact[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  // sql.js doesn't support array binds, so use IN with comma-joined ids (safe — all integers)
+  const rows = queryAll<FactRow>(
+    db,
+    `SELECT * FROM facts WHERE id IN (${ids.map((id) => Number(id)).join(",")})`
+  );
+  return rows.map(deserializeFact);
+}
+
 export async function getActiveFacts(): Promise<Fact[]> {
   const db = await getDb();
   const rows = queryAll<FactRow>(
@@ -470,4 +481,14 @@ export async function getUnansweredQuestions(): Promise<DriftFinding[]> {
     db,
     "SELECT * FROM drift_findings WHERE addressed = 0 AND question IS NOT NULL ORDER BY run_at DESC, id"
   ).map(deserializeDriftFinding);
+}
+
+export async function addressDriftFinding(id: number): Promise<void> {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  db.run(
+    sqlParams("UPDATE drift_findings SET addressed = 1, addressed_at = @now WHERE id = @id"),
+    convertParams({ now, id })
+  );
+  saveDb();
 }

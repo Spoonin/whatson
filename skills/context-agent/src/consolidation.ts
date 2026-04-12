@@ -19,7 +19,7 @@ import {
   type Fact,
 } from "./storage.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
-import { runDriftAnalysis, type DriftAnalysisResult } from "./drift.js";
+import { runDriftAnalysis, formatDriftSummary, type DriftAnalysisResult } from "./drift.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, "../data");
@@ -38,6 +38,7 @@ export interface ConsolidationSummary {
   indexUpdated: boolean;
   repoSync?: RepoSyncResult | { error: string } | { skipped: string };
   driftAnalysis?: DriftAnalysisResult | { error: string } | { skipped: string };
+  report: string;
 }
 
 /**
@@ -172,11 +173,11 @@ async function consolidate(newFacts: Fact[], allFacts: Fact[]): Promise<Consolid
   return { merged, contradictions };
 }
 
-function normalize(text: string): string {
+export function normalize(text: string): string {
   return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function contentOverlaps(a: string, b: string): boolean {
+export function contentOverlaps(a: string, b: string): boolean {
   const wordsA = new Set(normalize(a).split(" ").filter((w) => w.length > 4));
   const wordsB = normalize(b).split(" ").filter((w) => w.length > 4);
   const overlap = wordsB.filter((w) => wordsA.has(w));
@@ -373,6 +374,19 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
     notes: driftAnalysis ? JSON.stringify(driftAnalysis) : null,
   });
 
+  // Build human-readable report
+  const report = await formatConsolidationReport({
+    runAt,
+    factsProcessed: newFacts.length,
+    factsMerged: merged,
+    factsInvalidated: invalidated,
+    contradictionsFound: contradictions,
+    indexUpdated: true,
+    repoSync,
+    driftAnalysis,
+    report: "", // placeholder — filled below
+  });
+
   return {
     runAt,
     factsProcessed: newFacts.length,
@@ -382,5 +396,43 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
     indexUpdated: true,
     repoSync,
     driftAnalysis,
+    report,
   };
+}
+
+// ── Report formatting ────────────────────────────────────────────────────────
+
+async function formatConsolidationReport(summary: ConsolidationSummary): Promise<string> {
+  const date = summary.runAt.slice(0, 10);
+  const counts = await getFactCount();
+
+  const lines: string[] = [
+    `Consolidation Report (${date})`,
+    ``,
+    `Knowledge base: ${counts.active} active facts, ${counts.expired} expired`,
+    `Processed: ${summary.factsProcessed} new facts, ${summary.factsMerged} merged, ${summary.contradictionsFound} contradictions`,
+  ];
+
+  // Repo sync
+  if (summary.repoSync) {
+    if ("skipped" in summary.repoSync) {
+      lines.push(`Repo sync: skipped (${summary.repoSync.skipped})`);
+    } else if ("error" in summary.repoSync) {
+      lines.push(`Repo sync: error — ${summary.repoSync.error}`);
+    } else if (summary.repoSync.committed) {
+      const sha = summary.repoSync.commitSha?.slice(0, 7) ?? "?";
+      lines.push(`Repo sync: committed and pushed (${sha})`);
+    } else {
+      lines.push(`Repo sync: no changes`);
+    }
+  }
+
+  // Drift analysis
+  if (summary.driftAnalysis) {
+    lines.push(``);
+    const driftText = await formatDriftSummary(summary.driftAnalysis);
+    lines.push(driftText);
+  }
+
+  return lines.join("\n");
 }

@@ -10,7 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status, run_drift_analysis, get_drift_report } from "./index.js";
+import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status, run_drift_analysis, get_drift_report, resolve_drift_finding } from "./index.js";
 
 const server = new McpServer({
   name: "context-agent",
@@ -39,9 +39,21 @@ server.tool(
       source_url:  params.source_url,
       source_file: params.source_file,
     });
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-    };
+    const parts: Array<{ type: "text"; text: string }> = [
+      { type: "text", text: JSON.stringify(result, null, 2) },
+    ];
+    if (result.conflicts.length > 0) {
+      const alert = [
+        "\n⚠️ CONFLICTS DETECTED — flag these to the user immediately:",
+        ...result.conflicts.map(
+          (c) =>
+            `  New fact #${c.newFactId}: "${c.newText}"\n  conflicts with existing #${c.existingFactId}: "${c.existingText}" (source: ${c.existingSource})`
+        ),
+        "\nAsk the user: should the earlier fact be updated, or should both be kept?",
+      ].join("\n");
+      parts.push({ type: "text", text: alert });
+    }
+    return { content: parts };
   }
 );
 
@@ -110,7 +122,10 @@ server.tool(
   async () => {
     const result = await consolidate();
     return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      content: [
+        { type: "text", text: result.report },
+        { type: "text", text: "\n\n<details>\n" + JSON.stringify(result, null, 2) + "\n</details>" },
+      ],
     };
   }
 );
@@ -165,6 +180,22 @@ server.tool(
   {},
   async () => {
     const result = await get_drift_report();
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    };
+  }
+);
+
+// ── Tool: resolve_drift_finding ───────────────────────────────────────────
+
+server.tool(
+  "resolve_drift_finding",
+  "Mark a drift finding as addressed/resolved. Call when a stakeholder answers an open question or confirms an inconsistency has been handled.",
+  {
+    finding_id: z.number().describe("ID of the drift finding to resolve"),
+  },
+  async (params) => {
+    const result = await resolve_drift_finding({ finding_id: params.finding_id });
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
     };

@@ -7,8 +7,8 @@
 
 import { processMessage, processMessageWithUrls, processMessageLlm, processMessageWithUrlsLlm } from "./wal.js";
 import { extractUrls } from "./url-fetch.js";
-import { insertFact, searchFacts, type Fact, type SourceType, type Confidence } from "./storage.js";
-import { runConsolidation } from "./consolidation.js";
+import { insertFact, searchFacts, addressDriftFinding, type Fact, type SourceType, type Confidence } from "./storage.js";
+import { runConsolidation, normalize, contentOverlaps, type ConsolidationSummary } from "./consolidation.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
 import { retrieve, getStatus } from "./retrieval.js";
 import type { ExtractedFact } from "./llm-extract.js";
@@ -21,6 +21,49 @@ const CONFIDENCE_MAP: Record<string, Confidence> = {
   question:   "medium",
   opinion:    "low",
 };
+
+// ── Conflict detection ───────────────────────────────────────────────────────
+
+interface Conflict {
+  newFactId: number;
+  newText: string;
+  existingFactId: number;
+  existingText: string;
+  existingSource: string;
+}
+
+async function findConflicts(
+  newFactId: number,
+  newFact: ExtractedFact,
+): Promise<Conflict[]> {
+  // Extract significant keywords (>4 chars) for search
+  const words = normalize(newFact.text)
+    .split(" ")
+    .filter((w) => w.length > 4);
+  if (words.length === 0) return [];
+
+  // Search existing facts using the most distinctive keywords
+  const keyword = words.slice(0, 3).join(" ");
+  const existing = await searchFacts(keyword, [], 30);
+
+  const conflicts: Conflict[] = [];
+  for (const fact of existing) {
+    if (fact.id === newFactId) continue;
+    // Skip exact duplicates (handled by consolidation)
+    if (normalize(fact.content) === normalize(newFact.text)) continue;
+    // Check for meaningful overlap
+    if (contentOverlaps(newFact.text, fact.content)) {
+      conflicts.push({
+        newFactId,
+        newText: newFact.text,
+        existingFactId: fact.id!,
+        existingText: fact.content,
+        existingSource: fact.source,
+      });
+    }
+  }
+  return conflicts;
+}
 
 // ── Tool: wal_append ──────────────────────────────────────────────────────────
 
@@ -58,9 +101,14 @@ export async function wal_append(args: {
   message_id?: string;
   source_url?: string;
   source_file?: string;
-}): Promise<{ entries: Array<{ type: string; text: string; id: number; tags?: string[]; confidence?: string; source_url?: string }>; method: string }> {
+}): Promise<{
+  entries: Array<{ type: string; text: string; id: number; tags?: string[]; confidence?: string; source_url?: string }>;
+  method: string;
+  conflicts: Conflict[];
+}> {
   const urls = extractUrls(args.message);
   const result: Array<{ type: string; text: string; id: number; tags?: string[]; confidence?: string; source_url?: string }> = [];
+  const allConflicts: Conflict[] = [];
   let method = "llm";
 
   if (urls.length === 0) {
@@ -74,6 +122,8 @@ export async function wal_append(args: {
         args.message_id ?? null, null, args.source_file ?? null,
       );
       result.push(entry);
+      const conflicts = await findConflicts(entry.id, fact);
+      allConflicts.push(...conflicts);
     }
   } else {
     // Message contains URLs — use LLM extraction for text + each URL
@@ -88,6 +138,8 @@ export async function wal_append(args: {
         args.message_id ?? null, null, null,
       );
       result.push(entry);
+      const conflicts = await findConflicts(entry.id, fact);
+      allConflicts.push(...conflicts);
     }
 
     for (const { url, result: urlResult } of urlResults) {
@@ -97,11 +149,13 @@ export async function wal_append(args: {
           args.message_id ?? null, url, null,
         );
         result.push(entry);
+        const conflicts = await findConflicts(entry.id, fact);
+        allConflicts.push(...conflicts);
       }
     }
   }
 
-  return { entries: result, method };
+  return { entries: result, method, conflicts: allConflicts };
 }
 
 // ── Tool: storage_insert ──────────────────────────────────────────────────────
@@ -157,13 +211,7 @@ export async function storage_query(args: {
 
 // ── Tool: consolidate ─────────────────────────────────────────────────────────
 
-export async function consolidate(): Promise<{
-  factsProcessed:    number;
-  factsMerged:       number;
-  factsInvalidated:  number;
-  contradictionsFound: number;
-  indexUpdated:      boolean;
-}> {
+export async function consolidate(): Promise<ConsolidationSummary> {
   return runConsolidation();
 }
 
@@ -194,4 +242,13 @@ export async function get_drift_report(): Promise<{
   unansweredQuestions: import("./storage.js").DriftFinding[];
 }> {
   return getDriftReport();
+}
+
+// ── Tool: resolve_drift_finding ─────────────────────────────────────────────
+
+export async function resolve_drift_finding(args: {
+  finding_id: number;
+}): Promise<{ resolved: boolean }> {
+  await addressDriftFinding(args.finding_id);
+  return { resolved: true };
 }
