@@ -9,6 +9,7 @@ import { processMessage, processMessageWithUrls, processMessageLlm, processMessa
 import { extractUrls } from "./url-fetch.js";
 import { insertFact, searchFacts, type Fact, type SourceType, type Confidence } from "./storage.js";
 import { runConsolidation } from "./consolidation.js";
+import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
 import { retrieve, getStatus } from "./retrieval.js";
 import type { ExtractedFact } from "./llm-extract.js";
 
@@ -166,8 +167,31 @@ export async function consolidate(): Promise<{
   return runConsolidation();
 }
 
+// ── Tool: sync_repo ───────────────────────────────────────────────────────────
+
+export async function sync_repo(): Promise<RepoSyncResult> {
+  return syncToTargetRepo();
+}
+
 // ── Tool: get_status ──────────────────────────────────────────────────────────
 
 export async function get_status(): Promise<{ status: string }> {
   return { status: await getStatus() };
+}
+
+// ── Tool: run_drift_analysis ─────────────────────────────────────────────────
+
+import { runDriftAnalysis, getDriftReport, type DriftAnalysisResult } from "./drift.js";
+
+export async function run_drift_analysis(): Promise<DriftAnalysisResult> {
+  return runDriftAnalysis();
+}
+
+// ── Tool: get_drift_report ───────────────────────────────────────────────────
+
+export async function get_drift_report(): Promise<{
+  latestFindings: import("./storage.js").DriftFinding[];
+  unansweredQuestions: import("./storage.js").DriftFinding[];
+}> {
+  return getDriftReport();
 }

@@ -717,6 +717,140 @@ The target repo is cloned/pulled into a working directory inside the container. 
 
 ---
 
+## Part 8: Drift Analysis — Implementation vs. Decisions Consistency
+
+> Added: 2026-04-12
+> Status: Planned (POC uses Claude Code CLI; production path documented below)
+
+### 8.1 Goal
+
+After each consolidation, automatically analyze the target codebase against recorded decisions and facts. When the model finds inconsistencies (e.g. a decision says "use PostgreSQL 16" but the code uses SQLite, or a task tracker says "done" but the feature is missing), it produces structured questions for stakeholders.
+
+### 8.2 POC approach — Claude Code CLI
+
+Install `claude` (or `@anthropic-ai/claude-code` npm package) in the container. Add a Phase 5 to consolidation that shells out:
+
+```
+claude -p "<analysis prompt with facts>" \
+  --model claude-opus-4-6 \
+  --allowedTools "Read,Grep,Glob,Bash(git log:*),Bash(ls:*)" \
+  --output-format json
+```
+
+Each run:
+1. Export high-confidence decisions + recent facts as context
+2. Claude Code explores the cloned target repo (already at `data/target-repo/`)
+3. Collect findings as `{ fact_id, consistent: bool, evidence, question? }`
+4. Store in DB, surface via Telegram + MCP tool
+
+**Cost estimate:** ~$0.50–2.00/run with Opus. Daily = ~$15–60/month.
+
+### 8.3 Production path — what it takes to replace Claude Code with a native loop
+
+Analysis of Claude Code's source (see Part 6) reveals four components needed:
+
+#### What we already have (via OpenClaw)
+
+| Component | Status |
+|-----------|--------|
+| Agent loop (model → tool calls → execute → repeat) | OpenClaw provides this natively |
+| Tool protocol | MCP — proven with context-agent |
+| Model access | Anthropic API (Opus, Sonnet, Haiku) |
+| Session management | OpenClaw isolated sessions |
+| Knowledge base | context-agent (facts, consolidation, sync) |
+
+#### What's missing — three gaps
+
+**Gap 1: Filesystem MCP server for the target repo (~150 LOC, small effort)**
+
+The agent needs tools to explore code. Minimal tool set:
+
+| Tool | Purpose |
+|------|---------|
+| `read_file({ path })` | Read file contents |
+| `search({ pattern, path, glob? })` | Grep for patterns |
+| `find_files({ glob })` | Find files by name pattern |
+| `list_dir({ path })` | Directory listing |
+
+Options: write a thin MCP server (~150 LOC), or use `@modelcontextprotocol/server-filesystem`. Point it at the cloned target repo.
+
+**Gap 2: Context window management (large effort, the hard part)**
+
+This is Claude Code's core differentiator (see §6.4 Compact service). An analysis session may read 30+ files, overflowing the context window. Claude Code handles this with:
+
+- Token counting per message
+- Streaming summarization of old tool results when approaching the limit
+- Re-injection of system prompt + attachments after compression
+- Allowing re-reads of files post-compression
+
+**POC workaround:** Run N short, focused agent turns instead of one long session. Each turn analyzes one fact/decision against the code:
+
+```
+for each fact in high_confidence_decisions:
+  result = openclaw_agent_turn(
+    prompt: "Verify: '{fact.content}'. Search the codebase for evidence.",
+    tools: [filesystem-mcp, context-agent],
+    model: opus,
+    timeout: 60s
+  )
+  collect result.findings
+```
+
+Each turn stays within context limits. Trades cross-fact reasoning for reliability. Good enough for 80% of drift detection.
+
+**Production solution:** Implement a compact/summarization service inspired by Claude Code's `services/compact/` (see §6.4). This enables long multi-file reasoning chains. Estimated effort: 2-3 days, requires careful token counting and prompt engineering for summaries.
+
+**Gap 3: Analysis prompt (small effort, iterative)**
+
+System instructions specialized for drift detection:
+
+```markdown
+You are verifying whether a codebase matches stated project decisions.
+
+For the decision you're given:
+1. Search the codebase for related files (grep keywords, domain terms)
+2. Read relevant files (configs, schemas, code)
+3. Compare implementation vs. the stated decision
+4. Check for partial implementations or contradictions
+
+Output JSON:
+{ "consistent": bool, "evidence": "file:line — what you found", "question": "..." }
+
+Be specific. Cite file:line. Ignore style — only flag semantic drift.
+```
+
+### 8.4 Phased rollout
+
+| Phase | Approach | Effort | Quality |
+|-------|----------|--------|---------|
+| **POC (now)** | Claude Code CLI shelled out from Phase 5 | 1 day | High (full agentic loop) |
+| **v1** | Filesystem MCP + per-fact OpenClaw agent turns | 2-3 days | Good (80%, no cross-fact) |
+| **v2** | Add compact service for long reasoning chains | 3-5 days | High (matches Claude Code) |
+| **v3** | Task tracker integration (Linear/Jira MCP) | 1-2 days | Full coverage |
+
+### 8.5 Output schema
+
+```sql
+CREATE TABLE drift_findings (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_at          TEXT NOT NULL,
+  fact_id         INTEGER NOT NULL REFERENCES facts(id),
+  consistent      BOOLEAN NOT NULL,
+  evidence        TEXT,
+  question        TEXT,          -- NULL if consistent
+  addressed       BOOLEAN DEFAULT FALSE,
+  addressed_at    TEXT,
+  FOREIGN KEY (fact_id) REFERENCES facts(id)
+);
+```
+
+Surfaced via:
+- `context-agent__get_drift_report` MCP tool
+- Telegram message after consolidation (summary of inconsistencies)
+- Written to `docs/context/DRIFT.md` in the target repo on sync
+
+---
+
 ## References
 
 | Resource | URL |

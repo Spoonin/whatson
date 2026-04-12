@@ -10,7 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { wal_append, storage_insert, storage_query, consolidate, get_status } from "./index.js";
+import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status, run_drift_analysis, get_drift_report } from "./index.js";
 
 const server = new McpServer({
   name: "context-agent",
@@ -105,10 +105,24 @@ server.tool(
 
 server.tool(
   "consolidate",
-  "Run the 4-phase consolidation loop: Orient, Gather, Consolidate (dedup + contradiction resolution), Prune & Index. Call this on schedule or when the user requests /consolidate.",
+  "Run the 5-phase consolidation loop: Orient, Gather, Consolidate (dedup + contradiction resolution), Prune & Index, Drift Analysis. Call this on schedule or when the user requests /consolidate.",
   {},
   async () => {
     const result = await consolidate();
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    };
+  }
+);
+
+// ── Tool: sync_repo ─────────────────────────────────────────────────────────
+
+server.tool(
+  "sync_repo",
+  "Export the active knowledge base to the target repo's docs/context/ directory as markdown, then commit and push. Requires TARGET_REPO env var. Call this manually or rely on the consolidation phase to trigger it automatically.",
+  {},
+  async () => {
+    const result = await sync_repo();
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
     };
@@ -125,6 +139,34 @@ server.tool(
     const result = await get_status();
     return {
       content: [{ type: "text", text: result.status }],
+    };
+  }
+);
+
+// ── Tool: run_drift_analysis ───────────────────────────────────────────────
+
+server.tool(
+  "run_drift_analysis",
+  "Run drift analysis: verify the target codebase against recorded decisions and facts using Claude Code. Requires WHATSON_DRIFT_ENABLED=true. Call this when the user requests /drift or wants to check codebase consistency.",
+  {},
+  async () => {
+    const result = await run_drift_analysis();
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    };
+  }
+);
+
+// ── Tool: get_drift_report ─────────────────────────────────────────────────
+
+server.tool(
+  "get_drift_report",
+  "Return the latest drift analysis findings and any unanswered questions for stakeholders. Call when the user asks about drift, inconsistencies, or open questions.",
+  {},
+  async () => {
+    const result = await get_drift_report();
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
     };
   }
 );

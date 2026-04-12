@@ -1,7 +1,7 @@
 /**
- * Module 3: Consolidation Loop — 4-phase pipeline
+ * Module 3: Consolidation Loop — 5-phase pipeline
  *
- * Phases: Orient → Gather Signal → Consolidate → Prune & Index
+ * Phases: Orient → Gather Signal → Consolidate → Prune & Index → Drift Analysis
  * Triggered by cron (daily 03:00) or manually via /consolidate.
  */
 
@@ -14,9 +14,12 @@ import {
   insertRelation,
   logConsolidationPhase,
   getLastConsolidation,
+  getConsolidationRunCount,
   getFactCount,
   type Fact,
 } from "./storage.js";
+import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
+import { runDriftAnalysis, type DriftAnalysisResult } from "./drift.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, "../data");
@@ -33,6 +36,20 @@ export interface ConsolidationSummary {
   factsInvalidated: number;
   contradictionsFound: number;
   indexUpdated: boolean;
+  repoSync?: RepoSyncResult | { error: string } | { skipped: string };
+  driftAnalysis?: DriftAnalysisResult | { error: string } | { skipped: string };
+}
+
+/**
+ * Parse the WHATSON_SYNC_EVERY_N_CONSOLIDATION env var.
+ * Defaults to 1 (sync on every consolidation). Non-numeric or negative values
+ * also default to 1. Zero means "never auto-sync" (manual /sync only).
+ */
+function parseSyncEveryN(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 1;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 1;
+  return n;
 }
 
 // ── Phase 1: Orient ───────────────────────────────────────────────────────────
@@ -297,6 +314,33 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
   // Phase 4
   const t4 = Date.now();
   const { invalidated } = await pruneAndIndex(snapshot);
+
+  // Export to target repo (if configured). Gated by WHATSON_SYNC_EVERY_N_CONSOLIDATION:
+  //   0     → never auto-sync (manual /sync only)
+  //   1     → every run (default)
+  //   N>1   → every Nth run
+  // Failures are captured but must not abort the phase — local state is already committed.
+  let repoSync: RepoSyncResult | { error: string } | { skipped: string } | undefined;
+  const everyN = parseSyncEveryN(process.env.WHATSON_SYNC_EVERY_N_CONSOLIDATION);
+  if (everyN === 0) {
+    repoSync = { skipped: "WHATSON_SYNC_EVERY_N_CONSOLIDATION=0 (auto-sync disabled)" };
+  } else {
+    // getConsolidationRunCount() includes the current run (orient/gather/consolidate
+    // have already logged rows with this runAt), so numbering starts at 1.
+    const runNumber = await getConsolidationRunCount();
+    if (runNumber % everyN !== 0) {
+      repoSync = {
+        skipped: `run ${runNumber} not a multiple of ${everyN} (WHATSON_SYNC_EVERY_N_CONSOLIDATION)`,
+      };
+    } else {
+      try {
+        repoSync = await syncToTargetRepo();
+      } catch (e) {
+        repoSync = { error: e instanceof Error ? e.message : String(e) };
+      }
+    }
+  }
+
   await logConsolidationPhase({
     run_at: runAt,
     phase: "prune",
@@ -305,7 +349,28 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
     facts_invalidated: invalidated,
     contradictions_found: 0,
     duration_ms: Date.now() - t4,
-    notes: null,
+    notes: repoSync ? JSON.stringify(repoSync) : null,
+  });
+
+  // Phase 5: Drift Analysis (opt-in via WHATSON_DRIFT_ENABLED=true)
+  // Shells out to Claude Code CLI to verify codebase against recorded decisions.
+  // Non-fatal — failures are captured but do not abort consolidation.
+  let driftAnalysis: DriftAnalysisResult | { error: string } | { skipped: string } | undefined;
+  const t5 = Date.now();
+  try {
+    driftAnalysis = await runDriftAnalysis();
+  } catch (e) {
+    driftAnalysis = { error: e instanceof Error ? e.message : String(e) };
+  }
+  await logConsolidationPhase({
+    run_at: runAt,
+    phase: "drift",
+    facts_processed: "factsAnalyzed" in (driftAnalysis ?? {}) ? (driftAnalysis as DriftAnalysisResult).factsAnalyzed : 0,
+    facts_merged: 0,
+    facts_invalidated: 0,
+    contradictions_found: "inconsistencies" in (driftAnalysis ?? {}) ? (driftAnalysis as DriftAnalysisResult).inconsistencies : 0,
+    duration_ms: Date.now() - t5,
+    notes: driftAnalysis ? JSON.stringify(driftAnalysis) : null,
   });
 
   return {
@@ -315,5 +380,7 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
     factsInvalidated: invalidated,
     contradictionsFound: contradictions,
     indexUpdated: true,
+    repoSync,
+    driftAnalysis,
   };
 }

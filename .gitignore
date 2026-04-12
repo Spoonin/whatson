@@ -13,6 +13,7 @@ skills/context-agent/data/SESSION-STATE.md
 skills/context-agent/data/INDEX.md
 skills/context-agent/data/raw/
 !skills/context-agent/data/raw/.gitkeep
+skills/context-agent/data/target-repo/
 skills/context-agent/.built*
 
 # Docker runtime state

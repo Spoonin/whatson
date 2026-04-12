@@ -8,6 +8,14 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      TARGET_REPO: "${TARGET_REPO:-}"
+      WHATSON_CONTEXT_DIR: "${WHATSON_CONTEXT_DIR:-docs/context}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      WHATSON_COMMIT_AUTHOR: "${WHATSON_COMMIT_AUTHOR:-Whatson <whatson@bot.local>}"
+      WHATSON_SYNC_PUSH: "${WHATSON_SYNC_PUSH:-true}"
+      WHATSON_SYNC_EVERY_N_CONSOLIDATION: "${WHATSON_SYNC_EVERY_N_CONSOLIDATION:-1}"
+      WHATSON_DRIFT_ENABLED: "${WHATSON_DRIFT_ENABLED:-false}"
+      WHATSON_DRIFT_MODEL: "${WHATSON_DRIFT_MODEL:-claude-opus-4-6}"
     volumes:
       - ./data/openclaw-config:/home/node/.openclaw
       - ./skills:/home/node/.openclaw/workspace/skills

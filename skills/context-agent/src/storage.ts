@@ -179,6 +179,22 @@ function migrate(db: SqlJsDatabase): void {
       notes                TEXT
     );
   `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS drift_findings (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_at          TEXT    NOT NULL,
+      fact_id         INTEGER NOT NULL,
+      consistent      INTEGER NOT NULL DEFAULT 0,
+      evidence        TEXT,
+      question        TEXT,
+      addressed       INTEGER NOT NULL DEFAULT 0,
+      addressed_at    TEXT,
+      FOREIGN KEY (fact_id) REFERENCES facts(id)
+    );
+  `);
+  db.run("CREATE INDEX IF NOT EXISTS idx_drift_run ON drift_findings(run_at)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_drift_unanswered ON drift_findings(addressed, question)");
 }
 
 // ── Query helpers ─────────────────────────────────────────────────────────────
@@ -344,6 +360,16 @@ export async function logConsolidationPhase(entry: ConsolidationLogEntry): Promi
   saveDb();
 }
 
+/** Count distinct consolidation runs (one per unique run_at in the log). */
+export async function getConsolidationRunCount(): Promise<number> {
+  const db = await getDb();
+  const row = queryOne<{ n: number }>(
+    db,
+    "SELECT COUNT(DISTINCT run_at) as n FROM consolidation_log"
+  );
+  return row?.n ?? 0;
+}
+
 export async function getLastConsolidation(): Promise<string | null> {
   const db = await getDb();
   const row = queryOne<{ run_at: string }>(
@@ -364,4 +390,84 @@ export async function getFactCount(): Promise<{ active: number; expired: number 
     "SELECT COUNT(*) as n FROM facts WHERE valid_to IS NOT NULL"
   )!.n;
   return { active, expired };
+}
+
+// ── Drift findings ───────────────────────────────────────────────────────────
+
+export interface DriftFinding {
+  id?: number;
+  run_at: string;
+  fact_id: number;
+  consistent: boolean;
+  evidence: string | null;
+  question: string | null;
+  addressed: boolean;
+  addressed_at: string | null;
+}
+
+interface DriftFindingRow {
+  id: number;
+  run_at: string;
+  fact_id: number;
+  consistent: number;
+  evidence: string | null;
+  question: string | null;
+  addressed: number;
+  addressed_at: string | null;
+}
+
+function deserializeDriftFinding(row: DriftFindingRow): DriftFinding {
+  return { ...row, consistent: row.consistent === 1, addressed: row.addressed === 1 };
+}
+
+export async function insertDriftFinding(
+  finding: Omit<DriftFinding, "id" | "addressed" | "addressed_at">
+): Promise<number> {
+  const db = await getDb();
+  db.run(
+    sqlParams(`
+      INSERT INTO drift_findings (run_at, fact_id, consistent, evidence, question, addressed)
+      VALUES (@run_at, @fact_id, @consistent, @evidence, @question, 0)
+    `),
+    convertParams({
+      run_at: finding.run_at,
+      fact_id: finding.fact_id,
+      consistent: finding.consistent ? 1 : 0,
+      evidence: finding.evidence ?? null,
+      question: finding.question ?? null,
+    })
+  );
+  const row = queryOne<{ id: number }>(db, "SELECT last_insert_rowid() as id");
+  saveDb();
+  return row!.id;
+}
+
+export async function getDriftFindings(runAt?: string): Promise<DriftFinding[]> {
+  const db = await getDb();
+  if (runAt) {
+    return queryAll<DriftFindingRow>(
+      db,
+      sqlParams("SELECT * FROM drift_findings WHERE run_at = @run_at ORDER BY id"),
+      convertParams({ run_at: runAt })
+    ).map(deserializeDriftFinding);
+  }
+  // Latest run
+  const latest = queryOne<{ run_at: string }>(
+    db,
+    "SELECT run_at FROM drift_findings ORDER BY id DESC LIMIT 1"
+  );
+  if (!latest) return [];
+  return queryAll<DriftFindingRow>(
+    db,
+    sqlParams("SELECT * FROM drift_findings WHERE run_at = @run_at ORDER BY id"),
+    convertParams({ run_at: latest.run_at })
+  ).map(deserializeDriftFinding);
+}
+
+export async function getUnansweredQuestions(): Promise<DriftFinding[]> {
+  const db = await getDb();
+  return queryAll<DriftFindingRow>(
+    db,
+    "SELECT * FROM drift_findings WHERE addressed = 0 AND question IS NOT NULL ORDER BY run_at DESC, id"
+  ).map(deserializeDriftFinding);
 }

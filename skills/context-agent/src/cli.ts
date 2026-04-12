@@ -10,7 +10,7 @@
  *   node cli.js get_status
  */
 
-import { wal_append, storage_insert, storage_query, consolidate, get_status } from "./index.js";
+import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status } from "./index.js";
 
 const [,, command, ...rest] = process.argv;
 
@@ -79,13 +79,17 @@ async function main() {
       result = await consolidate();
       break;
 
+    case "sync_repo":
+      result = await sync_repo();
+      break;
+
     case "get_status":
       result = await get_status();
       break;
 
     default:
       console.error(`Unknown command: ${command}`);
-      console.error("Available: wal_append, storage_query, storage_insert, consolidate, get_status");
+      console.error("Available: wal_append, storage_query, storage_insert, consolidate, sync_repo, get_status");
       process.exit(1);
   }
 

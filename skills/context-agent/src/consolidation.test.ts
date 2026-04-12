@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   _setDbForTest,
   insertFact,
@@ -215,5 +215,80 @@ describe("consolidation", () => {
 
     const lastRun = await getLastConsolidation();
     expect(lastRun).not.toBeNull();
+  });
+});
+
+// ── Sync gating ─────────────────────────────────────────────────────────────
+
+describe("consolidation sync gating", () => {
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(async () => {
+    await _setDbForTest();
+    for (const k of ["WHATSON_SYNC_EVERY_N_CONSOLIDATION", "TARGET_REPO"]) {
+      saved[k] = process.env[k];
+    }
+    // No TARGET_REPO set → syncToTargetRepo() returns { skipped: "TARGET_REPO not configured" }
+    // That's fine for these tests — we only care about the N-gate deciding whether to call it at all.
+    delete process.env.TARGET_REPO;
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it("N=0 disables auto-sync (skipped with disabled reason)", async () => {
+    process.env.WHATSON_SYNC_EVERY_N_CONSOLIDATION = "0";
+    await insertFact(makeFact());
+    const summary = await runConsolidation();
+    expect(summary.repoSync).toBeDefined();
+    expect((summary.repoSync as { skipped: string }).skipped).toMatch(/disabled/);
+  });
+
+  it("N=1 attempts sync on every run (gate passes)", async () => {
+    process.env.WHATSON_SYNC_EVERY_N_CONSOLIDATION = "1";
+    await insertFact(makeFact());
+    const summary = await runConsolidation();
+    // Gate passed → syncToTargetRepo() was called → skipped because TARGET_REPO unset
+    expect(summary.repoSync).toBeDefined();
+    expect((summary.repoSync as { skipped: string }).skipped).toBe("TARGET_REPO not configured");
+  });
+
+  it("N=3 syncs only on runs 3, 6, 9…", async () => {
+    process.env.WHATSON_SYNC_EVERY_N_CONSOLIDATION = "3";
+
+    const skippedReasons: string[] = [];
+    for (let i = 1; i <= 4; i++) {
+      await insertFact(makeFact({ content: `fact ${i}` }));
+      const summary = await runConsolidation();
+      const rs = summary.repoSync as { skipped: string };
+      skippedReasons.push(rs.skipped);
+    }
+
+    // Run 1: skip (1 % 3 !== 0)
+    expect(skippedReasons[0]).toMatch(/run 1 not a multiple of 3/);
+    // Run 2: skip (2 % 3 !== 0)
+    expect(skippedReasons[1]).toMatch(/run 2 not a multiple of 3/);
+    // Run 3: gate passes → attempted → skipped because TARGET_REPO unset
+    expect(skippedReasons[2]).toBe("TARGET_REPO not configured");
+    // Run 4: skip (4 % 3 !== 0)
+    expect(skippedReasons[3]).toMatch(/run 4 not a multiple of 3/);
+  });
+
+  it("defaults to N=1 when env var unset", async () => {
+    delete process.env.WHATSON_SYNC_EVERY_N_CONSOLIDATION;
+    await insertFact(makeFact());
+    const summary = await runConsolidation();
+    expect((summary.repoSync as { skipped: string }).skipped).toBe("TARGET_REPO not configured");
+  });
+
+  it("defaults to N=1 when env var is garbage", async () => {
+    process.env.WHATSON_SYNC_EVERY_N_CONSOLIDATION = "banana";
+    await insertFact(makeFact());
+    const summary = await runConsolidation();
+    expect((summary.repoSync as { skipped: string }).skipped).toBe("TARGET_REPO not configured");
   });
 });
