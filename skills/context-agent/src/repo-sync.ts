@@ -158,6 +158,18 @@ function groupBySource(facts: Fact[]): Map<string, Fact[]> {
 
 // ── Rendering ────────────────────────────────────────────────────────────────
 
+/** Check if a correction likely refers to a given fact (lenient keyword overlap). */
+function correctionTargets(correction: string, fact: string): boolean {
+  const words = (s: string) => new Set(s.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/).filter((w) => w.length > 2));
+  const cWords = words(correction);
+  const fWords = words(fact);
+  let shared = 0;
+  for (const w of fWords) {
+    if (cWords.has(w)) shared++;
+  }
+  return shared >= 2;
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()
@@ -187,8 +199,9 @@ function renderIndex(
     `> Maintained by Whatson. Last updated: ${dateOnly(now)}`,
     `> Active facts: ${facts.length} · Topics: ${tagMap.size} · Sources: ${sourceMap.size}`,
     ``,
-    `Structured project context maintained automatically by Whatson.`,
-    `Agents should read this file before starting work on the project.`,
+    `Read this file first. It summarizes all project context below.`,
+    `Corrections override earlier facts. Open questions need stakeholder input.`,
+    `See \`topics/\` for detail by subject, \`sources/\` for raw extraction logs.`,
     ``,
     `## Topics`,
     ``,
@@ -196,7 +209,7 @@ function renderIndex(
 
   const topics = [...tagMap.entries()].sort((a, b) => b[1].length - a[1].length);
   for (const [tag, list] of topics) {
-    lines.push(`- [${tag}](topics/${slugify(tag)}.md) — ${list.length} facts`);
+    lines.push(`- [${tag}](topics/${slugify(tag)}.md) — ${list.length} fact${list.length === 1 ? "" : "s"}`);
   }
 
   lines.push(``, `## Recent Decisions`, ``);
@@ -215,6 +228,28 @@ function renderIndex(
     .slice(0, 20);
   for (const f of keyFacts) {
     lines.push(`- [${dateOnly(f.valid_from)}] ${f.content} *(${f.source})*`);
+  }
+
+  const corrections = facts
+    .filter((f) => f.source_type === "correction")
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, 10);
+  if (corrections.length > 0) {
+    lines.push(``, `## Corrections`, ``);
+    for (const c of corrections) {
+      lines.push(`- [${dateOnly(c.valid_from)}] ${c.content} *(${c.source})*`);
+    }
+  }
+
+  const openQuestions = facts
+    .filter((f) => f.source_type === "question")
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, 10);
+  if (openQuestions.length > 0) {
+    lines.push(``, `## Open Questions`, ``);
+    for (const q of openQuestions) {
+      lines.push(`- [${dateOnly(q.valid_from)}] ${q.content} *(${q.source})*`);
+    }
   }
 
   lines.push(``, `## Recent Sources`, ``);
@@ -243,10 +278,24 @@ function renderIndex(
 }
 
 function renderTopic(tag: string, facts: Fact[]): string {
+  const title = tag.charAt(0).toUpperCase() + tag.slice(1);
+
+  // Cross-references: collect other tags from facts in this topic
+  const otherTags = new Set<string>();
+  for (const f of facts) {
+    for (const t of f.tags) {
+      if (t !== tag) otherTags.add(t);
+    }
+  }
+  const seeAlso = [...otherTags].sort().map((t) => `[${t}](${slugify(t)}.md)`).join(", ");
+  const header = seeAlso
+    ? `> ${facts.length} active fact${facts.length === 1 ? "" : "s"} · See also: ${seeAlso}`
+    : `> ${facts.length} active fact${facts.length === 1 ? "" : "s"}`;
+
   const lines: string[] = [
-    `# ${tag}`,
+    `# ${title}`,
     ``,
-    `> ${facts.length} active facts`,
+    header,
     ``,
   ];
 
@@ -254,6 +303,9 @@ function renderTopic(tag: string, facts: Fact[]): string {
   for (const f of facts) {
     (byType[f.source_type] ??= []).push(f);
   }
+
+  // Non-correction facts for overlap matching
+  const nonCorrections = facts.filter((f) => f.source_type !== "correction");
 
   const typeOrder: Array<[string, string]> = [
     ["decision", "Decisions"],
@@ -271,6 +323,13 @@ function renderTopic(tag: string, facts: Fact[]): string {
     const sorted = list.sort((a, b) => b.created_at.localeCompare(a.created_at));
     for (const f of sorted) {
       lines.push(`- [${dateOnly(f.valid_from)}] ${f.content} *(${f.source}, ${f.confidence})*`);
+      // For corrections, find which fact they override
+      if (type === "correction") {
+        const overridden = nonCorrections.find((o) => correctionTargets(f.content, o.content));
+        if (overridden) {
+          lines.push(`  - Overrides: "${overridden.content}" (${dateOnly(overridden.valid_from)})`);
+        }
+      }
     }
     lines.push(``);
   }

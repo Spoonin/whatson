@@ -62,6 +62,27 @@ Parameters:
 - `tags` (required): Array of topic tags
 - `raw_message` (required): Original verbatim message
 
+### context-agent__sync_repo
+Export the active knowledge base to the target repo's `docs/context/` directory as markdown, then commit and push. Requires `TARGET_REPO` env var.
+
+No parameters.
+
+### context-agent__run_drift_analysis
+Run drift analysis: verify the target codebase against recorded decisions and facts. Requires `WHATSON_DRIFT_ENABLED=true`.
+
+No parameters.
+
+### context-agent__get_drift_report
+Return the latest drift analysis findings and any unanswered questions for stakeholders.
+
+No parameters.
+
+### context-agent__resolve_drift_finding
+Mark a drift finding as addressed/resolved.
+
+Parameters:
+- `finding_id` (required): ID of the drift finding to resolve
+
 ## Response pattern
 
 1. **First**: Call `context-agent__wal_append` with the user's message
