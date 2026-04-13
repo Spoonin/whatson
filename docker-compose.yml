@@ -16,6 +16,9 @@ services:
       WHATSON_SYNC_EVERY_N_CONSOLIDATION: "${WHATSON_SYNC_EVERY_N_CONSOLIDATION:-1}"
       WHATSON_DRIFT_ENABLED: "${WHATSON_DRIFT_ENABLED:-false}"
       WHATSON_DRIFT_MODEL: "${WHATSON_DRIFT_MODEL:-claude-opus-4-6}"
+      VOYAGE_API_KEY: "${VOYAGE_API_KEY:-}"
+      WHATSON_EMBEDDING_MODEL: "${WHATSON_EMBEDDING_MODEL:-voyage-3-lite}"
+      WHATSON_EMBEDDING_DIMS: "${WHATSON_EMBEDDING_DIMS:-512}"
     volumes:
       - ./data/openclaw-config:/home/node/.openclaw
       - ./skills:/home/node/.openclaw/workspace/skills

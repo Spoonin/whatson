@@ -1,15 +1,18 @@
 /**
- * Module 4: Retrieval — keyword search + attribution
+ * Module 4: Retrieval — hybrid search (FTS5 + vector) with RRF fusion
  *
  * Pipeline:
  * 1. Extract keywords and tags from the incoming question
- * 2. SQL query: active facts matching keyword/tags
- * 3. Rank by: confidence DESC, created_at DESC
- * 4. Build a context block for LLM (~2000 token budget)
- * 5. Format with source attribution per fact
+ * 2. FTS5 keyword search → ranked list A
+ * 3. Vector KNN search (if embeddings available) → ranked list B
+ * 4. RRF fusion merges A + B
+ * 5. Confidence + recency tiebreak
+ * 6. Build a context block for LLM (~2000 token budget)
+ * 7. Format with source attribution per fact
  */
 
-import { searchFacts, type Fact } from "./storage.js";
+import { searchFacts, searchFactsByVector, getFactsByIds, hasVecSupport, type Fact } from "./storage.js";
+import { embedText } from "./embeddings.js";
 
 const TOKEN_BUDGET = 2000;
 // Rough estimate: 1 token ≈ 4 chars
@@ -97,48 +100,87 @@ function buildContextBlock(facts: AttributedFact[]): { block: string; truncated:
   return { block: lines.join("\n"), truncated };
 }
 
+// ── Reciprocal Rank Fusion ───────────────────────────────────────────────────
+
+const RRF_K = 60; // Standard RRF constant
+
+export function reciprocalRankFusion(
+  ftsResults: { id: number; rank: number }[],
+  vecResults: { id: number; rank: number }[],
+): Map<number, number> {
+  const scores = new Map<number, number>();
+
+  for (const { id, rank } of ftsResults) {
+    scores.set(id, (scores.get(id) ?? 0) + 1 / (RRF_K + rank));
+  }
+  for (const { id, rank } of vecResults) {
+    scores.set(id, (scores.get(id) ?? 0) + 1 / (RRF_K + rank));
+  }
+
+  return scores;
+}
+
 // ── Main retrieval function ───────────────────────────────────────────────────
 
 export async function retrieve(question: string, limit = 20): Promise<RetrievalResult> {
   const { keywords, tags } = extractKeywords(question);
 
-  // Try each keyword independently and merge results
-  const seen = new Set<number>();
-  const factMap = new Map<number, Fact>();
-
+  // ── FTS5 keyword search (ranked list A) ──
+  const ftsFactMap = new Map<number, Fact>();
   for (const kw of keywords.slice(0, 5)) {
     const results = await searchFacts(kw, tags, limit);
     for (const f of results) {
-      if (!seen.has(f.id!)) {
-        seen.add(f.id!);
-        factMap.set(f.id!, f);
+      if (!ftsFactMap.has(f.id!)) ftsFactMap.set(f.id!, f);
+    }
+  }
+  if (ftsFactMap.size === 0 && tags.length > 0) {
+    for (const f of await searchFacts("", tags, limit)) ftsFactMap.set(f.id!, f);
+  }
+
+  // ── Vector KNN search (ranked list B) ──
+  const vecRanked: { id: number; rank: number }[] = [];
+  if (hasVecSupport()) {
+    const queryEmbedding = await embedText(question);
+    if (queryEmbedding) {
+      const vecResults = await searchFactsByVector(queryEmbedding, limit);
+      for (let i = 0; i < vecResults.length; i++) {
+        vecRanked.push({ id: vecResults[i].factId, rank: i + 1 });
       }
     }
   }
 
-  // If no keyword matched, search by tags only
-  if (factMap.size === 0 && tags.length > 0) {
-    const results = await searchFacts("", tags, limit);
-    for (const f of results) {
-      factMap.set(f.id!, f);
-    }
-  }
+  // ── Fusion ──
+  const ftsRanked = [...ftsFactMap.keys()].map((id, i) => ({ id, rank: i + 1 }));
 
-  // Final fallback: no keywords and no tags (e.g. bare "?" message) — return recent active facts
-  if (factMap.size === 0) {
-    const results = await searchFacts("", [], limit);
-    for (const f of results) {
-      factMap.set(f.id!, f);
-    }
-  }
+  let ranked: Fact[];
 
-  // Sort: confidence first, then recency
-  const confidenceRank: Record<string, number> = { high: 0, medium: 1, low: 2 };
-  const ranked = [...factMap.values()].sort((a, b) => {
-    const cmp = (confidenceRank[a.confidence] ?? 1) - (confidenceRank[b.confidence] ?? 1);
-    if (cmp !== 0) return cmp;
-    return b.created_at.localeCompare(a.created_at);
-  });
+  if (vecRanked.length > 0) {
+    // RRF merge
+    const scores = reciprocalRankFusion(ftsRanked, vecRanked);
+    const sortedIds = [...scores.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([id]) => id);
+
+    // Fetch full facts for any IDs we don't already have from FTS
+    const missingIds = sortedIds.filter((id) => !ftsFactMap.has(id));
+    const extraFacts = missingIds.length > 0 ? await getFactsByIds(missingIds) : [];
+    const allFacts = new Map(ftsFactMap);
+    for (const f of extraFacts) allFacts.set(f.id!, f);
+
+    ranked = sortedIds.map((id) => allFacts.get(id)).filter((f): f is Fact => !!f);
+  } else if (ftsFactMap.size > 0) {
+    // FTS only — confidence + recency sort
+    const confidenceRank: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    ranked = [...ftsFactMap.values()].sort((a, b) => {
+      const cmp = (confidenceRank[a.confidence] ?? 1) - (confidenceRank[b.confidence] ?? 1);
+      if (cmp !== 0) return cmp;
+      return b.created_at.localeCompare(a.created_at);
+    });
+  } else {
+    // Final fallback: recent active facts
+    ranked = await searchFacts("", [], limit);
+  }
 
   const attributed: AttributedFact[] = ranked.map((f) => ({
     id: f.id!,

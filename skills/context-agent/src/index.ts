@@ -7,10 +7,11 @@
 
 import { processMessage, processMessageWithUrls, processMessageLlm, processMessageWithUrlsLlm } from "./wal.js";
 import { extractUrls } from "./url-fetch.js";
-import { insertFact, searchFacts, addressDriftFinding, type Fact, type SourceType, type Confidence } from "./storage.js";
+import { insertFact, searchFacts, addressDriftFinding, insertFactEmbedding, type Fact, type SourceType, type Confidence } from "./storage.js";
 import { runConsolidation, normalize, contentOverlaps, type ConsolidationSummary } from "./consolidation.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
 import { retrieve, getStatus, type RetrievalResult } from "./retrieval.js";
+import { embedText } from "./embeddings.js";
 import type { ExtractedFact } from "./llm-extract.js";
 
 // Confidence defaults per entry type
@@ -91,6 +92,12 @@ async function storeFact(
     source_url:    sourceUrl,
     source_file:   sourceFile,
   });
+
+  // Embed asynchronously — never blocks or fails the insert
+  embedText(fact.text).then((vec) => {
+    if (vec) insertFactEmbedding(id, vec);
+  }).catch((e) => console.error("[embed-on-insert]", e));
+
   return { type: fact.type, text: fact.text, id, tags: fact.tags, confidence: fact.confidence, ...(sourceUrl ? { source_url: sourceUrl } : {}) };
 }
 

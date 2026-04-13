@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status, retrieve_context, run_drift_analysis, get_drift_report, resolve_drift_finding } from "./index.js";
+import { backfillEmbeddings } from "./embeddings.js";
 
 const server = new McpServer({
   name: "context-agent",
@@ -235,6 +236,11 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[context-agent-mcp] Server started on stdio");
+
+  // Backfill embeddings for facts that don't have them yet (non-blocking)
+  backfillEmbeddings().catch((e) =>
+    console.error("[context-agent-mcp] Backfill error:", e)
+  );
 }
 
 main().catch((err) => {

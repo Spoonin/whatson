@@ -15,6 +15,7 @@
     "@anthropic-ai/sdk": "^0.88.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^12.9.0",
+    "sqlite-vec": "^0.1.9",
     "zod": "3.25.28"
   },
   "devDependencies": {
@@ -24,6 +25,8 @@
     "vitest": "^4.1.4"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3"]
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
   }
 }

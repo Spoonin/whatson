@@ -6,6 +6,7 @@
 
 import Database from "better-sqlite3";
 type DB = Database.Database;
+import * as sqliteVec from "sqlite-vec";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -73,6 +74,11 @@ export interface ConsolidationLogEntry {
 // ── DB connection (singleton) ─────────────────────────────────────────────────
 
 let _db: DB | null = null;
+let _vecLoaded = false;
+
+export function hasVecSupport(): boolean {
+  return _vecLoaded;
+}
 
 export async function getDb(): Promise<DB> {
   if (!_db) {
@@ -81,6 +87,12 @@ export async function getDb(): Promise<DB> {
     _db = new Database(DB_PATH);
     _db.pragma("journal_mode = WAL");
     _db.pragma("foreign_keys = ON");
+    try {
+      sqliteVec.load(_db);
+      _vecLoaded = true;
+    } catch (e: unknown) {
+      console.error("[context-agent] sqlite-vec not loaded:", (e as Error).message);
+    }
     migrate(_db);
   }
   return _db;
@@ -93,6 +105,12 @@ export async function _setDbForTest(db?: DB): Promise<DB> {
   }
   _db = db ?? new Database(":memory:");
   _db.pragma("foreign_keys = ON");
+  try {
+    sqliteVec.load(_db);
+    _vecLoaded = true;
+  } catch {
+    _vecLoaded = false;
+  }
   migrate(_db);
   return _db;
 }
@@ -162,6 +180,7 @@ function migrate(db: DB): void {
   `);
 
   migrateFts5(db);
+  migrateVec0(db);
 }
 
 // External-content FTS5: no row duplication; triggers keep it in sync.
@@ -196,6 +215,21 @@ function migrateFts5(db: DB): void {
 
     INSERT INTO facts_fts(rowid, content, tags)
       SELECT id, content, COALESCE(tags, '') FROM facts;
+  `);
+}
+
+// vec0 virtual table for embedding vectors. Only created if sqlite-vec loaded.
+function migrateVec0(db: DB): void {
+  if (!_vecLoaded) return;
+  const existing = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fact_embeddings'")
+    .get();
+  if (existing) return;
+
+  db.exec(`
+    CREATE VIRTUAL TABLE fact_embeddings USING vec0(
+      embedding float[512]
+    );
   `);
 }
 
@@ -264,6 +298,10 @@ export async function expireFact(id: number, supersededById?: number): Promise<v
   db.prepare(
     "UPDATE facts SET valid_to = @now, updated_at = @now, superseded_by = @sup WHERE id = @id"
   ).run({ now, sup: supersededById ?? null, id });
+  // Clean up embedding for expired fact
+  if (_vecLoaded) {
+    db.prepare("DELETE FROM fact_embeddings WHERE rowid = ?").run(BigInt(id));
+  }
 }
 
 export async function searchFacts(keyword: string, tags: string[] = [], limit = 20): Promise<Fact[]> {
@@ -458,4 +496,53 @@ export async function addressDriftFinding(id: number): Promise<void> {
     now,
     id,
   });
+}
+
+// ── Embeddings (vec0) ───────────────────────────────────────────────────────
+
+export async function insertFactEmbedding(factId: number, embedding: Float32Array): Promise<void> {
+  if (!_vecLoaded) return;
+  const db = await getDb();
+  db.prepare("DELETE FROM fact_embeddings WHERE rowid = ?").run(BigInt(factId));
+  db.prepare(
+    "INSERT INTO fact_embeddings (rowid, embedding) VALUES (?, ?)"
+  ).run(BigInt(factId), embedding);
+}
+
+export async function deleteFactEmbedding(factId: number): Promise<void> {
+  if (!_vecLoaded) return;
+  const db = await getDb();
+  db.prepare("DELETE FROM fact_embeddings WHERE rowid = ?").run(BigInt(factId));
+}
+
+export async function searchFactsByVector(
+  queryEmbedding: Float32Array,
+  k = 20,
+): Promise<{ factId: number; distance: number }[]> {
+  if (!_vecLoaded) return [];
+  const db = await getDb();
+  const rows = db
+    .prepare(
+      `SELECT rowid, distance
+       FROM fact_embeddings
+       WHERE embedding MATCH ?
+       ORDER BY distance
+       LIMIT ?`
+    )
+    .all(queryEmbedding, k) as { rowid: number; distance: number }[];
+  return rows.map((r) => ({ factId: Number(r.rowid), distance: r.distance }));
+}
+
+export async function getFactsWithoutEmbeddings(): Promise<number[]> {
+  if (!_vecLoaded) return [];
+  const db = await getDb();
+  const rows = db
+    .prepare(
+      `SELECT f.id FROM facts f
+       LEFT JOIN fact_embeddings e ON e.rowid = f.id
+       WHERE f.valid_to IS NULL AND e.rowid IS NULL
+       ORDER BY f.id`
+    )
+    .all() as { id: number }[];
+  return rows.map((r) => r.id);
 }
