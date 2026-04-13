@@ -194,19 +194,13 @@ describe("repo-sync", () => {
     const db = await _setDbForTest();
 
     // Insert two facts from the same source but with different created_at days.
-    const now = new Date().toISOString();
-    db.run(
+    const insertStmt = db.prepare(
       `INSERT INTO facts (content, source, source_type, confidence, valid_from, valid_to,
         created_at, updated_at, superseded_by, tags, raw_message, message_id, source_url, source_file)
-       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, NULL, NULL, NULL, NULL)`,
-      ["Fact from day 1", "telegram:@bob", "fact", "medium", "2026-04-10T12:00:00Z", "2026-04-10T12:00:00Z", "2026-04-10T12:00:00Z", "[]"]
+       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, NULL, NULL, NULL, NULL)`
     );
-    db.run(
-      `INSERT INTO facts (content, source, source_type, confidence, valid_from, valid_to,
-        created_at, updated_at, superseded_by, tags, raw_message, message_id, source_url, source_file)
-       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, NULL, NULL, NULL, NULL)`,
-      ["Fact from day 2", "telegram:@bob", "fact", "medium", "2026-04-11T12:00:00Z", "2026-04-11T12:00:00Z", "2026-04-11T12:00:00Z", "[]"]
-    );
+    insertStmt.run("Fact from day 1", "telegram:@bob", "fact", "medium", "2026-04-10T12:00:00Z", "2026-04-10T12:00:00Z", "2026-04-10T12:00:00Z", "[]");
+    insertStmt.run("Fact from day 2", "telegram:@bob", "fact", "medium", "2026-04-11T12:00:00Z", "2026-04-11T12:00:00Z", "2026-04-11T12:00:00Z", "[]");
 
     const result = await syncToTargetRepo();
     expect(result.committed).toBe(true);

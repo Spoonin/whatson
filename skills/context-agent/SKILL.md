@@ -41,6 +41,13 @@ Parameters:
 ### context-agent__get_status
 Return health snapshot: total facts, last consolidation, open questions. Use on `/status` or when user asks about the knowledge base state.
 
+### context-agent__retrieve_context
+Answer a natural language question from the knowledge base. Extracts keywords, searches via FTS5, ranks by relevance/confidence/recency, and returns a formatted context block with source attribution. **Use this when the user asks a question about project knowledge.**
+
+Parameters:
+- `question` (required): The user's question in natural language
+- `limit` (optional): Max facts to consider (default 20)
+
 ### context-agent__consolidate
 Run the 4-phase consolidation loop (dedup, contradiction resolution, pruning, index rebuild). Use on `/consolidate`.
 

@@ -7,7 +7,13 @@
 
 ## Project Goal
 
-Build a long-lived AI agent for collecting, structuring, and consolidating context from multiple sources. The agent runs on top of **OpenClaw** — a self-hosted AI assistant gateway with multi-channel support.
+Build a continuously operating agent that:
+
+* Collects context from heterogeneous sources (code, Teams, documents, human interviews).
+* Structures and organizes the gathered knowledge.
+* Maintains coherence at scale (resolves contradictions, invalidates outdated info).
+* Provides the LLM with relevant context for specific tasks.
+* Operates autonomously with periodic human-in-the-loop interaction.
 
 ---
 
@@ -848,6 +854,558 @@ Surfaced via:
 - `context-agent__get_drift_report` MCP tool
 - Telegram message after consolidation (summary of inconsistencies)
 - Written to `docs/context/DRIFT.md` in the target repo on sync
+
+---
+
+## Part 9: Operational Findings & Next Steps
+
+> Added: 2026-04-13
+
+### 9.1 Telegram poller stall — diagnosis and partial mitigation
+
+**Symptom:** `getUpdates` long-polls hang for 750s–5500s while the gateway HTTP stays up, so Docker reported the container `healthy` through the entire failure. Worst observed stall: 73 minutes.
+
+**Root cause:** network-level flakiness between the Docker bridge and `api.telegram.org`, surfacing as `UND_ERR_SOCKET` in undici. The Telegram plugin (inside the OpenClaw base image, not this repo) already has a stall detector and self-restart logic, but its recovery itself gets stuck (`Polling runner stop timed out after 15s`).
+
+**Mitigation shipped — observability only:**
+- [tools/gateway-healthcheck.sh](tools/gateway-healthcheck.sh) — local `/healthz` + `api.telegram.org` reachability check.
+- [docker-compose.yml](docker-compose.yml) — wired as the gateway healthcheck (60s interval, 15s timeout, 3 retries).
+- **Does not auto-recycle.** Docker's `restart: unless-stopped` doesn't act on `unhealthy` alone. During a stall, `docker ps` now correctly shows `unhealthy`; a human still runs `docker compose restart openclaw-gateway`.
+
+**Deferred:** auto-recycling via `willfarrell/autoheal` sidecar was prototyped and reverted — it added a new service + docker-socket mount for a feature that isn't critical yet. Revisit if manual recycling becomes a burden.
+
+**Not yet investigated:** the underlying network/DNS/IPv6 issue. Lower urgency now that unhealthy state is at least visible.
+
+### 9.2 Storage migration — sql.js → better-sqlite3 + FTS5
+
+**Motivation — two real smells in [skills/context-agent/src/storage.ts](skills/context-agent/src/storage.ts):**
+1. `saveDb()` rewrites the entire database on every mutation ([storage.ts:121-127](skills/context-agent/src/storage.ts#L121-L127)). sql.js has no incremental persistence — O(db size) per write, will get painful as the fact corpus grows.
+2. `searchFacts` uses `LIKE '%kw%'` ([storage.ts:314-333](skills/context-agent/src/storage.ts#L314-L333)). No tokenization, no ranking — the retrieval ceiling.
+
+**Decision: migrate to better-sqlite3 + FTS5 (no vector search in phase 1).**
+
+- Schema unchanged. All existing tables, types, and bitemporal semantics survive verbatim.
+- Drop `async` from storage functions. sql.js was only async because of WASM init; SQLite is synchronous. A simplification, not a refactor.
+- Fixes the whole-file-rewrite problem (better-sqlite3 does real incremental writes).
+- FTS5 is compiled into better-sqlite3 by default — no extension loading, no Docker wrinkle. Replaces `LIKE` with ranked keyword search.
+- Native addon concern is bounded: better-sqlite3 ships prebuilt binaries for linux x64/arm64; `npm install` works without a build toolchain.
+
+**Options considered and rejected:**
+
+| Option | Why rejected |
+|---|---|
+| Keep sql.js | The two smells above are the bottlenecks blocking the next roadmap items |
+| libSQL (embedded) | TypeScript client panics on parameterized FTS5 inserts — [tursodatabase/libsql#1811](https://github.com/tursodatabase/libsql/issues/1811), open since Dec 2024, no maintainer triage in 16+ months. External-content FTS5 via triggers might sidestep it, but building on an untriaged crash bug in our exact codepath is a code smell, and the maintainer silence is a priority signal about the embedded TS surface. |
+| PGLite + pgvector | New runtime dep, schema migration, overkill for current scale. Revisit when multi-agent writes or ≫10M facts become real. |
+| GBrain as storage | See §9.3 — different schema, different domain. |
+
+### 9.3 GBrain evaluation — pattern, not dependency
+
+[github.com/garrytan/gbrain](https://github.com/garrytan/gbrain): agent knowledge base on Postgres + pgvector, hybrid search via reciprocal rank fusion (RRF), explicit OpenClaw support.
+
+**Overlap:** both are agent memory on markdown + OpenClaw. **Divergence:** Whatson is project-context-centric (bitemporal facts, decisions, drift, typed relations). GBrain is person/meeting-centric (personal knowledge, voice, email/calendar). Schemas don't align — adopting GBrain as storage means either forking it or running two schemas in one DB, which is worse than the current sql.js.
+
+**Conclusion: adopt the pattern, not the project.**
+
+- Borrow the hybrid-search approach (keyword + vector + RRF) when we implement vector search in Phase 2.
+- Do not depend on GBrain as a library or storage backend — couples our roadmap to another project's release cadence for no structural gain.
+
+**Phase 2 (deferred, separate change):** add vector search via the `sqlite-vec` loadable extension + ~30 lines of RRF fusion in TypeScript. Sequenced after Phase 1 so each change is independently verifiable.
+
+### 9.4 Revised near-term roadmap
+
+1. ~~**Storage: sql.js → better-sqlite3 + FTS5** (§9.2).~~ **Done** (2026-04-13). Incremental writes + FTS5 BM25 keyword search.
+2. **LLM-powered consolidation** (Part 11) — the primary-goal blocker. Semantic duplicate detection + contradiction resolution. FTS5 retrieval is sufficient to find candidate clusters.
+3. **Vector search via sqlite-vec + RRF** (Part 10) — improves retrieval quality, but not blocking. Detailed plan in §10.
+4. **Proactive gap detection** — unblocked by (1) + (2).
+5. **Multi-source ingestion** (GitHub PRs/issues, repo markdown) — after retrieval quality is solid.
+6. **Telegram network root-cause investigation** (§9.1) — deprioritized now that unhealthy state is visible.
+
+---
+
+## Part 10: Vector Search — sqlite-vec + Embeddings + RRF
+
+> Added: 2026-04-13
+> Status: Planned (Phase 2 of retrieval upgrade; Phase 1 = FTS5, done)
+> Depends on: §9.2 better-sqlite3 migration (done)
+
+### 10.1 Goal
+
+Add semantic (vector) search to the fact corpus. Combine it with the existing FTS5 keyword search using Reciprocal Rank Fusion (RRF), borrowing the hybrid-search pattern from GBrain (§9.3). This upgrades retrieval from "exact keyword match" to "meaning-aware search" — critical for LLM-powered consolidation (finding semantic duplicates) and drift detection (matching decisions to code patterns).
+
+### 10.2 Architecture overview
+
+```
+Query: "What database did we choose?"
+  │
+  ├─→ FTS5 MATCH (keyword, BM25 ranked)  ──→ ranked list A
+  │
+  ├─→ sqlite-vec KNN (cosine, k=20)      ──→ ranked list B
+  │
+  └─→ RRF fusion (merge A + B)           ──→ final ranked list
+        │
+        └─→ confidence + recency tiebreak ──→ returned to caller
+```
+
+Both search paths query the same `facts` table. FTS5 via the existing `facts_fts` virtual table; vector via a new `fact_embeddings` vec0 virtual table. Fusion happens in TypeScript (~30 lines), not SQL.
+
+### 10.3 Embedding model selection
+
+**Decision: Voyage AI `voyage-3-lite` (512 dimensions)**
+
+| Option | Dims | Cost/1M tokens | SDK | Verdict |
+|--------|------|----------------|-----|---------|
+| Voyage `voyage-3-lite` | 512 | $0.02 | `voyageai` npm | **Selected** |
+| Voyage `voyage-3` | 1024 | $0.06 | `voyageai` npm | Overkill for short facts |
+| OpenAI `text-embedding-3-small` | 1536 (or 512 via `dimensions`) | $0.02 | `openai` npm | Adds second AI vendor dependency |
+| Ollama `nomic-embed-text` | 768 | Free | HTTP to localhost | Adds infra (sidecar container) |
+| Jina `jina-embeddings-v3` | 1024 | $0.02 (free tier: 1M) | HTTP | Less mature ecosystem |
+
+**Why Voyage:**
+- Anthropic's recommended embedding partner — stays in the same vendor ecosystem as our Haiku/Opus usage.
+- 512 dimensions is optimal for our corpus (short text snippets, hundreds to low thousands of facts). Higher dims waste storage with no retrieval benefit at this scale.
+- Cost is negligible: ~100 facts × ~50 tokens each = 5,000 tokens per embedding batch. At $0.02/1M tokens, that's effectively free.
+- The `voyageai` npm package follows the OpenAI API shape (`POST /v1/embeddings`), so swapping providers later is trivial.
+
+**Configuration:**
+```env
+# In .env
+VOYAGE_API_KEY=pa-...
+WHATSON_EMBEDDING_MODEL=voyage-3-lite    # default
+WHATSON_EMBEDDING_DIMS=512               # default, must match vec0 table
+```
+
+**Fallback behavior:** If `VOYAGE_API_KEY` is not set, embedding is skipped entirely. FTS5 keyword search continues to work alone. No crash, no degradation of existing functionality.
+
+### 10.4 Schema changes
+
+**New vec0 virtual table** (created in `migrateSqliteVec()`, called from `migrate()`):
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS fact_embeddings USING vec0(
+  fact_id INTEGER PRIMARY KEY,
+  embedding float[512]
+);
+```
+
+- `fact_id` maps to `facts.id` (not a FOREIGN KEY — vec0 doesn't support them, enforced in application code).
+- `float[512]` = 512 × 4 bytes = 2KB per fact. At 10,000 facts = 20MB — trivial.
+- No triggers needed (unlike FTS5 external-content mode). Embeddings are inserted explicitly after the fact is saved + embedded.
+
+**No changes to existing tables.** The `facts`, `facts_fts`, `fact_relations`, `consolidation_log`, `drift_findings` tables are untouched.
+
+### 10.5 Extension loading
+
+sqlite-vec is a loadable SQLite extension. The `sqlite-vec` npm package exports a `load()` helper:
+
+```typescript
+import * as sqliteVec from "sqlite-vec";
+import Database from "better-sqlite3";
+
+const db = new Database("context.db");
+sqliteVec.load(db);  // registers vec0, vec_distance_cosine, etc.
+```
+
+**When to load:** In `getDb()` after opening the database, before `migrate()`. Guarded by a try/catch — if sqlite-vec is not installed (e.g., in a test environment that doesn't need it), log a warning and skip. Vector search returns empty results; FTS5 still works.
+
+**Docker:** sqlite-vec ships prebuilt binaries for linux-x64 via npm. The extension is pure C with zero dependencies, so Debian Bookworm compatibility is not a concern. `pnpm install` in the entrypoint handles it — same pattern as better-sqlite3.
+
+### 10.6 Embedding pipeline
+
+**When embeddings are generated:**
+
+1. **On `insertFact()`** — after the fact is inserted into SQLite, embed it asynchronously. If the API call fails, the fact is saved without an embedding (logged, not fatal). A background backfill can catch up later.
+
+2. **On startup (backfill)** — query for facts that exist in `facts` but not in `fact_embeddings`. Embed in batches of 50. This handles:
+   - Existing facts from before sqlite-vec was added (migration path).
+   - Facts where the embedding API call failed on insert.
+   - Re-embedding after a model change (delete all from `fact_embeddings`, restart).
+
+3. **On consolidation** — when facts are merged/superseded, delete the expired fact's embedding. The surviving fact's embedding is already present.
+
+**Embedding function:**
+
+```typescript
+// In a new file: src/embeddings.ts (~80 lines)
+
+export async function embedText(text: string): Promise<Float32Array | null> {
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey) return null;
+  
+  const resp = await fetch("https://api.voyageai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: process.env.WHATSON_EMBEDDING_MODEL ?? "voyage-3-lite",
+      input: [text],
+      output_dimension: Number(process.env.WHATSON_EMBEDDING_DIMS ?? 512),
+    }),
+  });
+  
+  const json = await resp.json();
+  return new Float32Array(json.data[0].embedding);
+}
+
+export async function embedBatch(texts: string[]): Promise<(Float32Array | null)[]> {
+  // Voyage supports batch embedding (up to 128 inputs per call)
+  // Chunk into batches of 50 to stay well under limits
+}
+```
+
+**Why `fetch` instead of the `voyageai` npm package:** One less dependency. The API is a single POST endpoint. The package adds type safety we can get with 5 lines of interface.
+
+### 10.7 Vector search
+
+**KNN query via vec0:**
+
+```sql
+SELECT fact_id, distance
+FROM fact_embeddings
+WHERE embedding MATCH ?  -- Float32Array of the query embedding
+  AND k = ?              -- number of nearest neighbors
+ORDER BY distance
+```
+
+**Important vec0 constraints:**
+- `k = N` goes in the WHERE clause, not LIMIT.
+- Distance metric is L2 (Euclidean) by default. For cosine similarity, use `vec_distance_cosine()` as a scalar reranker, or normalize vectors before insertion (unit vectors make L2 ≈ cosine ranking).
+- Metadata WHERE operators: `=`, `!=`, `>`, `>=`, `<`, `<=` only. No LIKE, no IS NULL, no functions.
+
+**Decision: normalize to unit vectors at insert time.** This makes L2 distance equivalent to cosine distance ranking, avoiding a post-hoc rerank step. The normalization is 3 lines in TypeScript.
+
+### 10.8 Reciprocal Rank Fusion (RRF)
+
+The GBrain pattern for combining keyword and vector results:
+
+```typescript
+// In retrieval.ts — replaces the current keyword-only search
+
+function reciprocalRankFusion(
+  ftsResults: { id: number; rank: number }[],
+  vecResults: { id: number; rank: number }[],
+  k: number = 60  // RRF constant (standard value)
+): Map<number, number> {
+  const scores = new Map<number, number>();
+  
+  for (const { id, rank } of ftsResults) {
+    scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank));
+  }
+  for (const { id, rank } of vecResults) {
+    scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank));
+  }
+  
+  return scores;  // sort by score DESC to get final ranking
+}
+```
+
+**How it's used in `retrieve()`:**
+
+1. Run FTS5 search (existing `searchFacts()`) → ranked list A.
+2. Embed the query → run vec0 KNN → ranked list B.
+3. RRF-merge A and B → combined scores.
+4. Fetch full `Fact` rows for the top N IDs.
+5. Apply confidence + recency tiebreak (existing logic).
+6. Build context block (existing logic).
+
+**Graceful degradation:**
+- If `VOYAGE_API_KEY` not set → vector search skipped, FTS5 only (current behavior).
+- If sqlite-vec not loaded → vector search skipped, FTS5 only.
+- If embedding API fails → vector search skipped for that query, FTS5 only.
+- FTS5 is always the baseline. Vector search only improves results, never degrades them.
+
+### 10.9 Files changed
+
+| File | Change | Lines (est.) |
+|------|--------|-------------|
+| `package.json` | Add `sqlite-vec` dependency | +1 |
+| `src/embeddings.ts` | **New file.** `embedText()`, `embedBatch()`, `backfillEmbeddings()`, vector normalization | ~80 |
+| `src/storage.ts` | Load sqlite-vec extension in `getDb()`. Add `migrateSqliteVec()`. Add `insertFactEmbedding()`, `searchFactsByVector()`, `deleteFactEmbedding()` | ~50 |
+| `src/retrieval.ts` | Add `reciprocalRankFusion()`. Update `retrieve()` to run both searches and merge. | ~40 |
+| `src/consolidation.ts` | Call `deleteFactEmbedding()` when expiring a fact | +2 |
+| `.env.example` | Add `VOYAGE_API_KEY`, `WHATSON_EMBEDDING_MODEL`, `WHATSON_EMBEDDING_DIMS` | +3 |
+| `docker-compose.yml` | Pass `VOYAGE_API_KEY` to container | +1 |
+
+**Not changed:** `wal.ts`, `llm-extract.ts`, `mcp-server.ts`, `drift.ts`, `repo-sync.ts`, `cli.ts`, `index.ts`, test files (except new `embeddings.test.ts`).
+
+### 10.10 Testing strategy
+
+1. **Unit tests (`embeddings.test.ts`):**
+   - `embedText()` with mocked fetch → returns Float32Array of correct dimensions.
+   - `embedText()` without `VOYAGE_API_KEY` → returns null.
+   - Vector normalization → unit length.
+   - `embedBatch()` chunking logic.
+
+2. **Integration tests (`storage.ts` additions to existing test file):**
+   - `insertFactEmbedding()` → row appears in `fact_embeddings`.
+   - `searchFactsByVector()` → returns nearest neighbors in distance order.
+   - `deleteFactEmbedding()` → row removed.
+   - sqlite-vec not loaded → `searchFactsByVector()` returns `[]`.
+
+3. **RRF tests (`retrieval.ts`):**
+   - Two ranked lists → fusion produces expected order.
+   - One list empty → other list's ranking preserved.
+   - Overlapping IDs → boosted in combined ranking.
+
+4. **Backfill test:**
+   - Insert 3 facts without embeddings → `backfillEmbeddings()` fills them.
+   - Insert 3 facts, 1 already embedded → backfill skips the existing one.
+
+### 10.11 Migration path for existing data
+
+1. On first startup after deploy, `migrateSqliteVec()` creates the `fact_embeddings` table (empty).
+2. `backfillEmbeddings()` runs on startup — detects facts missing from `fact_embeddings`, embeds in batches.
+3. Until backfill completes, vector search returns partial results; FTS5 covers the gap.
+4. For the current corpus (~1 fact in the existing `context.db`), backfill is instant.
+
+### 10.12 Cost projection
+
+| Scenario | Facts | Tokens | Cost |
+|----------|-------|--------|------|
+| Current POC | ~10 | ~500 | < $0.01 |
+| After 1 month | ~200 | ~10,000 | < $0.01 |
+| After 1 year | ~2,000 | ~100,000 | < $0.01 |
+| Re-embed all (model change) | 2,000 | ~100,000 | < $0.01 |
+| Query embeddings (100/day) | — | ~5,000/day | < $0.01/day |
+
+At $0.02/1M tokens, embedding costs are negligible for this project's scale.
+
+### 10.13 Implementation order
+
+1. Add `sqlite-vec` dependency, load extension in `getDb()`, create vec0 table in migration. Verify: `SELECT vec_version()` works.
+2. Create `src/embeddings.ts` — `embedText()`, `embedBatch()`, normalization. Verify: unit tests with mocked fetch.
+3. Add `insertFactEmbedding()`, `searchFactsByVector()`, `deleteFactEmbedding()` to storage.ts. Verify: integration tests with real sqlite-vec.
+4. Update `retrieval.ts` — add RRF, update `retrieve()`. Verify: RRF unit tests + end-to-end with query embedding.
+5. Wire `insertFact()` → embed → `insertFactEmbedding()` flow. Verify: inserting a fact with `VOYAGE_API_KEY` set produces an embedding row.
+6. Add `backfillEmbeddings()` to startup. Verify: existing facts get embedded.
+7. Update `.env.example`, `docker-compose.yml`. Verify: container starts cleanly.
+
+### 10.14 Open questions
+
+- **Voyage model version:** `voyage-3-lite` is listed as an older model. Should we use `voyage-3` (1024d, $0.06/1M) instead for better quality? At our scale the cost difference is irrelevant. **Recommendation:** start with `voyage-3-lite` at 512d; switchable via env var, no schema migration needed (just rebuild embeddings).
+- **Embedding on insert vs. batch-only:** Inline embedding on `insertFact()` adds ~100ms latency per fact insert (API round trip). For Telegram ingestion this is fine (user doesn't notice). For bulk imports, batch mode would be faster. **Recommendation:** inline first, add batch endpoint if bulk import becomes a use case.
+- **Query embedding caching:** Should we cache query embeddings for repeated searches? **Recommendation:** no — queries are rare, the API is fast (<100ms), and caching adds complexity. Revisit if query volume grows.
+
+---
+
+## Part 11: LLM-Powered Consolidation
+
+> Added: 2026-04-13
+> Status: Planned (roadmap item #2, primary-goal blocker)
+> Depends on: §9.2 better-sqlite3 + FTS5 (done)
+
+### 11.1 Goal
+
+Replace the heuristic Phase 3 (`consolidate()` in `consolidation.ts:118-174`) with LLM-based semantic analysis. The current implementation has two ceilings:
+
+1. **Duplicate detection** uses `normalize()` exact string match (`consolidation.ts:132-134`). "We chose Postgres" and "Database decision: PostgreSQL" are not detected as duplicates.
+2. **Contradiction detection** uses `contentOverlaps()` word-overlap heuristic (`consolidation.ts:180-184`). Two words of length >4 matching is both too loose (false positives on unrelated facts sharing common domain words) and too tight (misses semantic contradictions with different vocabulary).
+
+The gap analysis in §6.8 rates both as "Critical." This is the bottleneck that blocks the primary goal: **"maintains coherence at scale."**
+
+### 11.2 What changes, what doesn't
+
+| Component | Changes? | Notes |
+|-----------|----------|-------|
+| Phase 1: Orient | No | Unchanged |
+| Phase 2: Gather Signal | No | Unchanged |
+| **Phase 3: Consolidate** | **Yes** | Heuristic → LLM. Core of this plan |
+| Phase 4: Prune & Index | No | Unchanged |
+| Phase 5: Drift Analysis | No | Benefits from better input (cleaner fact base) |
+| `ConsolidationSummary` interface | No | Same shape returned to callers |
+| `consolidation_log` writes | No | Same schema |
+| `runConsolidation()` entry point | Minimal | Calls new `consolidate()`, same signature |
+
+**Scope is surgical:** only the `consolidate()` function body and its helpers (`normalize()`, `contentOverlaps()`) are replaced. Everything above and below it stays.
+
+### 11.3 Design: cluster → LLM → act
+
+```
+Phase 3 input: newFacts[] + allFacts[]
+  │
+  ├─ 1. Cluster: group facts by topic
+  │     For each new fact:
+  │       FTS5 search(fact.content) against allFacts → candidate cluster
+  │       Add tag-matched facts that FTS5 missed
+  │       Cap cluster size at 20 facts
+  │
+  ├─ 2. LLM call (one per cluster, Haiku):
+  │     Input: the cluster of facts (id, content, source_type, confidence, date)
+  │     Output: JSON array of actions:
+  │       { action: "merge", keep: id, expire: [ids], reason: "..." }
+  │       { action: "contradict", keep: id, expire: [ids], reason: "..." }
+  │       { action: "relate", ids: [id, id], relation: "supports|related", reason: "..." }
+  │       { action: "keep", id: id }  (no change needed)
+  │
+  └─ 3. Execute actions:
+        merge → expireFact(expired, kept) + insertRelation(supersedes)
+        contradict → expireFact(old, new) + insertRelation(contradicts)
+        relate → insertRelation(supports/related)
+        keep → no-op
+```
+
+### 11.4 Clustering strategy
+
+The cluster quality determines the LLM's ability to find duplicates. Two complementary methods:
+
+**Method A — FTS5 search (primary):** For each new fact, use `searchFacts(fact.content)` to find semantically similar active facts. FTS5 with Porter stemming handles inflections ("decided" → "decide") and ranks by BM25 relevance. Top 15 results form the initial cluster.
+
+**Method B — Tag overlap (supplement):** Facts sharing ≥1 tag with the new fact are added if not already in the cluster. Caps the cluster at 20 total.
+
+**Deduplication across clusters:** A fact may appear in multiple clusters (e.g., it's relevant to two new facts). Track processed fact IDs across clusters to avoid redundant LLM analysis. If a fact was already expired by a previous cluster's action, skip it.
+
+**Why not one giant LLM call for all facts?** Cost and reliability. A corpus of 200 facts × ~50 tokens = 10,000 tokens input. Haiku handles this, but the output quality degrades with large, unfocused inputs. Focused clusters of 5-20 facts produce more reliable decisions.
+
+### 11.5 LLM prompt
+
+```
+You are a knowledge base consolidation agent. You are given a cluster of facts
+from a project knowledge base. Each fact has an ID, content, type, confidence,
+and date.
+
+Your task is to analyze the cluster and identify:
+
+1. **Duplicates** — facts that express the same information in different words.
+   Keep the most complete/recent version. Expire the others.
+
+2. **Contradictions** — facts that make conflicting claims about the same topic.
+   Keep the most recent or most authoritative (higher confidence). Expire the
+   contradicted fact. If you can't determine which is correct, keep both and
+   mark them as related (the human will resolve).
+
+3. **Relations** — facts that support or are related to each other but are not
+   duplicates. Link them.
+
+Rules:
+- A "correction" type always supersedes a non-correction on the same topic.
+- Higher confidence supersedes lower confidence, all else equal.
+- More recent supersedes older, all else equal.
+- When in doubt, keep both facts — false merges lose data, false keeps don't.
+- Do NOT invent new facts or modify existing fact text.
+
+Respond with a JSON array of actions:
+
+[
+  {"action": "merge", "keep": 5, "expire": [3, 8], "reason": "Same decision about PostgreSQL"},
+  {"action": "contradict", "keep": 12, "expire": [2], "reason": "Correction supersedes original"},
+  {"action": "relate", "ids": [5, 14], "relation": "supports", "reason": "Both about DB choice"},
+  {"action": "keep", "id": 7}
+]
+
+If no actions are needed, respond with: []
+```
+
+The prompt emphasizes **conservatism** ("when in doubt, keep both"). False merges lose data; false keeps just add noise that a future consolidation can fix.
+
+### 11.6 Model choice
+
+**Decision: Haiku (`claude-haiku-4-5-20251001`)** — same model as `llm-extract.ts`.
+
+| Model | Cost (input/output per 1M tokens) | Speed | Quality for this task |
+|-------|----------------------------------|-------|----------------------|
+| Haiku 4.5 | $0.80 / $4.00 | ~50ms TTFT | Sufficient — structured comparison of short texts |
+| Sonnet 4.6 | $3.00 / $15.00 | ~100ms TTFT | Better but 4× cost, not justified for fact comparison |
+| Opus 4.6 | $15.00 / $75.00 | ~200ms TTFT | Overkill |
+
+**Cost per consolidation run:**
+- Cluster count: ~5-20 (depends on new fact volume since last run)
+- Input per cluster: ~500-1500 tokens (5-20 facts × 50-80 tokens each + prompt)
+- Output per cluster: ~100-300 tokens (action list)
+- Total per run: ~10,000-30,000 tokens input + ~2,000-5,000 output
+- Cost per run: ~$0.01-0.03
+- Daily at 03:00: ~$0.30-0.90/month
+
+Negligible compared to drift analysis ($15-60/month at §8.2).
+
+### 11.7 Fallback behavior
+
+Following the pattern from `llm-extract.ts:99-101`:
+
+1. If `ANTHROPIC_API_KEY` not set → fall back to current heuristic (`normalize()` + `contentOverlaps()`).
+2. If LLM call fails (network, rate limit, malformed response) → fall back to heuristic for that cluster, log warning, continue.
+3. If LLM returns unparseable JSON → skip that cluster (conservative: keep all facts), log warning.
+
+**No new env var needed.** The fallback is automatic — if the API key exists (which it does, it's required for the gateway), LLM consolidation is active. The heuristic becomes the degraded-mode path, not the primary path.
+
+### 11.8 Response parsing
+
+Reuse the defensive parsing pattern from `llm-extract.ts:145-192`:
+
+```typescript
+interface ConsolidationAction {
+  action: "merge" | "contradict" | "relate" | "keep";
+  keep?: number;         // fact ID to keep (merge/contradict)
+  expire?: number[];     // fact IDs to expire (merge/contradict)
+  ids?: number[];        // fact IDs to relate (relate)
+  relation?: RelationType;
+  reason?: string;
+  id?: number;           // fact ID (keep)
+}
+
+function parseConsolidationResponse(text: string): ConsolidationAction[] {
+  // 1. Strip markdown code fences if present
+  // 2. JSON.parse, falling back to regex array extraction
+  // 3. Validate each action: required fields, valid IDs, valid action type
+  // 4. Reject actions referencing unknown fact IDs (safety)
+  // 5. Return validated actions; skip malformed entries
+}
+```
+
+**Critical safety check:** Every fact ID in the response must exist in the input cluster. The LLM cannot reference facts it wasn't shown. This prevents hallucinated IDs from corrupting the database.
+
+### 11.9 Files changed
+
+| File | Change | Lines (est.) |
+|------|--------|-------------|
+| `src/consolidation.ts` | Replace `consolidate()` internals. Add `clusterFacts()`, `consolidateCluster()`, `parseConsolidationResponse()`. Keep `normalize()` and `contentOverlaps()` as heuristic fallback. | ~120 net new |
+| `src/consolidation.test.ts` | Add LLM consolidation tests with mocked Anthropic client. Keep existing heuristic tests (they now test the fallback path). | ~80 net new |
+
+**Not changed:** `storage.ts`, `retrieval.ts`, `wal.ts`, `llm-extract.ts`, `mcp-server.ts`, `drift.ts`, `repo-sync.ts`, `cli.ts`, `index.ts`, `package.json`, `docker-compose.yml`, `.env.example`.
+
+No new dependencies. Uses the existing `@anthropic-ai/sdk` (already in `package.json`).
+
+### 11.10 Testing strategy
+
+**1. Unit tests — LLM response parsing:**
+- Valid actions array → parsed correctly.
+- Markdown-fenced JSON → extracted and parsed.
+- Malformed JSON → returns empty (skip cluster).
+- Actions with unknown fact IDs → those actions filtered out.
+- Mixed valid/invalid actions → valid ones preserved.
+
+**2. Unit tests — clustering:**
+- 3 facts, 2 share keywords → grouped in one cluster.
+- 3 facts, 2 share tags but no keywords → grouped by tag.
+- Cluster capped at 20 facts.
+- Already-processed facts not re-clustered.
+
+**3. Integration tests — LLM consolidation (mocked client):**
+- Two semantically identical facts ("We use Postgres" / "Database: PostgreSQL") → LLM returns merge action → older fact expired, relation inserted.
+- Correction supersedes existing fact → LLM returns contradict action → original expired.
+- Unrelated facts → LLM returns keep actions → no changes.
+- LLM call fails → falls back to heuristic → existing heuristic tests still pass.
+
+**4. Existing tests preserved:**
+- All current `consolidation.test.ts` tests continue to pass. They test behaviors that both the heuristic and LLM paths should produce (exact duplicates merged, corrections supersede, stale pruned, empty DB handled). The LLM path should be at least as good as the heuristic.
+
+### 11.11 Implementation order
+
+1. **Extract Anthropic client helper.** `llm-extract.ts` has `getClient()` / `_setClientForTest()`. Extract to a shared `src/anthropic.ts` (or import directly from `llm-extract.ts` if clean). Avoid duplicating the client singleton.
+2. **Write `clusterFacts()`.** Input: `newFacts[], allFacts[]`. Output: `Fact[][]` (array of clusters). Uses `searchFacts()` + tag overlap. Add unit tests.
+3. **Write `consolidateCluster()`.** Input: one cluster (`Fact[]`). Output: `ConsolidationAction[]`. Makes one Haiku call, parses response. Add unit tests with mocked client.
+4. **Write `parseConsolidationResponse()`.** Defensive JSON parsing + ID validation. Add unit tests.
+5. **Replace `consolidate()` body.** Call `clusterFacts()` → for each cluster, `consolidateCluster()` → execute actions. Heuristic fallback on failure. Run full test suite.
+6. **Manual verification.** Insert 10 facts via Telegram with known duplicates and contradictions. Run `/consolidate`. Verify merged/contradicted facts in the DB and INDEX.md.
+
+### 11.12 Success criteria
+
+1. **Semantic duplicates detected:** "We decided to use PostgreSQL" and "Database choice: Postgres" → merged (one expired, relation inserted). Current heuristic misses this.
+2. **Semantic contradictions detected:** "We use Redis for caching" and "Memcached is our caching layer" → contradiction flagged, newer/higher-confidence kept. Current heuristic only catches explicit `correction` types.
+3. **All existing tests green.** No regression.
+4. **Graceful degradation.** Unset `ANTHROPIC_API_KEY` → heuristic path, same behavior as today.
+5. **Cost per run < $0.05.** Verified via Anthropic dashboard after a real run.
 
 ---
 

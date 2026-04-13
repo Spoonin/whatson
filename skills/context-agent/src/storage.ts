@@ -1,11 +1,11 @@
 /**
  * Module 2: Storage — SQLite + Temporal Knowledge Graph
  *
- * Uses sql.js (pure WASM SQLite) — no native addons needed.
- * Exposes typed CRUD helpers used by WAL and Consolidation modules.
+ * Uses better-sqlite3 (native). Functions stay async-typed for caller compatibility.
  */
 
-import initSqlJs, { type Database as SqlJsDatabase, type BindParams } from "sql.js";
+import Database from "better-sqlite3";
+type DB = Database.Database;
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -70,66 +70,37 @@ export interface ConsolidationLogEntry {
   notes: string | null;
 }
 
-// ── sql.js init ──────────────────────────────────────────────────────────────
-
-let _SQL: Awaited<ReturnType<typeof initSqlJs>> | null = null;
-
-async function getSqlJs() {
-  if (!_SQL) {
-    _SQL = await initSqlJs();
-  }
-  return _SQL;
-}
-
 // ── DB connection (singleton) ─────────────────────────────────────────────────
 
-let _db: SqlJsDatabase | null = null;
+let _db: DB | null = null;
 
-export async function getDb(): Promise<SqlJsDatabase> {
+export async function getDb(): Promise<DB> {
   if (!_db) {
-    const SQL = await getSqlJs();
-    if (fs.existsSync(DB_PATH)) {
-      const buf = fs.readFileSync(DB_PATH);
-      _db = new SQL.Database(buf);
-    } else {
-      _db = new SQL.Database();
-    }
-    _db.run("PRAGMA journal_mode = WAL");
-    _db.run("PRAGMA foreign_keys = ON");
+    const dir = path.dirname(DB_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    _db = new Database(DB_PATH);
+    _db.pragma("journal_mode = WAL");
+    _db.pragma("foreign_keys = ON");
     migrate(_db);
   }
   return _db;
 }
 
-/** Replace the singleton with a custom DB instance (for tests). */
-export async function _setDbForTest(db?: SqlJsDatabase): Promise<SqlJsDatabase> {
+/** Replace the singleton with a fresh in-memory DB (for tests). */
+export async function _setDbForTest(db?: DB): Promise<DB> {
   if (_db) {
     try { _db.close(); } catch {}
   }
-  if (db) {
-    _db = db;
-  } else {
-    const SQL = await getSqlJs();
-    _db = new SQL.Database();
-    _db.run("PRAGMA foreign_keys = ON");
-  }
+  _db = db ?? new Database(":memory:");
+  _db.pragma("foreign_keys = ON");
   migrate(_db);
   return _db;
 }
 
-/** Persist current DB state to disk. */
-export function saveDb(): void {
-  if (!_db) return;
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const data = _db.export();
-  fs.writeFileSync(DB_PATH, Buffer.from(data));
-}
-
 // ── Migrations ────────────────────────────────────────────────────────────────
 
-function migrate(db: SqlJsDatabase): void {
-  db.run(`
+function migrate(db: DB): void {
+  db.exec(`
     CREATE TABLE IF NOT EXISTS facts (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       content         TEXT    NOT NULL,
@@ -148,13 +119,11 @@ function migrate(db: SqlJsDatabase): void {
       source_file     TEXT,
       FOREIGN KEY (superseded_by) REFERENCES facts(id)
     );
-  `);
-  db.run("CREATE INDEX IF NOT EXISTS idx_facts_valid    ON facts(valid_from, valid_to)");
-  db.run("CREATE INDEX IF NOT EXISTS idx_facts_source   ON facts(source_type)");
-  db.run("CREATE INDEX IF NOT EXISTS idx_facts_tags     ON facts(tags)");
-  db.run("CREATE INDEX IF NOT EXISTS idx_facts_message  ON facts(message_id)");
+    CREATE INDEX IF NOT EXISTS idx_facts_valid    ON facts(valid_from, valid_to);
+    CREATE INDEX IF NOT EXISTS idx_facts_source   ON facts(source_type);
+    CREATE INDEX IF NOT EXISTS idx_facts_tags     ON facts(tags);
+    CREATE INDEX IF NOT EXISTS idx_facts_message  ON facts(message_id);
 
-  db.run(`
     CREATE TABLE IF NOT EXISTS fact_relations (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       fact_id         INTEGER NOT NULL,
@@ -164,9 +133,7 @@ function migrate(db: SqlJsDatabase): void {
       FOREIGN KEY (fact_id)         REFERENCES facts(id),
       FOREIGN KEY (related_fact_id) REFERENCES facts(id)
     );
-  `);
 
-  db.run(`
     CREATE TABLE IF NOT EXISTS consolidation_log (
       id                   INTEGER PRIMARY KEY AUTOINCREMENT,
       run_at               TEXT    NOT NULL,
@@ -178,9 +145,7 @@ function migrate(db: SqlJsDatabase): void {
       duration_ms          INTEGER,
       notes                TEXT
     );
-  `);
 
-  db.run(`
     CREATE TABLE IF NOT EXISTS drift_findings (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       run_at          TEXT    NOT NULL,
@@ -192,48 +157,46 @@ function migrate(db: SqlJsDatabase): void {
       addressed_at    TEXT,
       FOREIGN KEY (fact_id) REFERENCES facts(id)
     );
+    CREATE INDEX IF NOT EXISTS idx_drift_run ON drift_findings(run_at);
+    CREATE INDEX IF NOT EXISTS idx_drift_unanswered ON drift_findings(addressed, question);
   `);
-  db.run("CREATE INDEX IF NOT EXISTS idx_drift_run ON drift_findings(run_at)");
-  db.run("CREATE INDEX IF NOT EXISTS idx_drift_unanswered ON drift_findings(addressed, question)");
+
+  migrateFts5(db);
 }
 
-// ── Query helpers ─────────────────────────────────────────────────────────────
+// External-content FTS5: no row duplication; triggers keep it in sync.
+// Backfills from `facts` on first creation so existing DBs gain search.
+function migrateFts5(db: DB): void {
+  const existing = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='facts_fts'")
+    .get();
+  if (existing) return;
 
-/** Run a SELECT and return rows as typed objects. */
-function queryAll<T>(db: SqlJsDatabase, sql: string, params: BindParams = {}): T[] {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-  const rows: T[] = [];
-  while (stmt.step()) {
-    rows.push(stmt.getAsObject() as T);
-  }
-  stmt.free();
-  return rows;
-}
+  db.exec(`
+    CREATE VIRTUAL TABLE facts_fts USING fts5(
+      content,
+      tags,
+      content='facts',
+      content_rowid='id',
+      tokenize='porter unicode61'
+    );
 
-function queryOne<T>(db: SqlJsDatabase, sql: string, params: BindParams = {}): T | undefined {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-  let row: T | undefined;
-  if (stmt.step()) {
-    row = stmt.getAsObject() as T;
-  }
-  stmt.free();
-  return row;
-}
+    CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN
+      INSERT INTO facts_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+    END;
 
-/** sql.js uses $param syntax for named parameters. Convert @param → $param. */
-function convertParams(params: Record<string, unknown>): BindParams {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(params)) {
-    out[`$${k}`] = v ?? null;
-  }
-  return out as BindParams;
-}
+    CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN
+      INSERT INTO facts_fts(facts_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
+    END;
 
-/** Convert @param placeholders in SQL to $param for sql.js. */
-function sqlParams(sql: string): string {
-  return sql.replace(/@(\w+)/g, "$$$1");
+    CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN
+      INSERT INTO facts_fts(facts_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
+      INSERT INTO facts_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+    END;
+
+    INSERT INTO facts_fts(rowid, content, tags)
+      SELECT id, content, COALESCE(tags, '') FROM facts;
+  `);
 }
 
 // ── Facts CRUD ────────────────────────────────────────────────────────────────
@@ -241,18 +204,18 @@ function sqlParams(sql: string): string {
 export async function insertFact(fact: Omit<Fact, "id" | "created_at" | "updated_at">): Promise<number> {
   const db = await getDb();
   const now = new Date().toISOString();
-  db.run(
-    sqlParams(`
-      INSERT INTO facts
+  const info = db
+    .prepare(
+      `INSERT INTO facts
         (content, source, source_type, confidence, valid_from, valid_to,
          created_at, updated_at, superseded_by, tags, raw_message,
          message_id, source_url, source_file)
-      VALUES
+       VALUES
         (@content, @source, @source_type, @confidence, @valid_from, @valid_to,
          @created_at, @updated_at, @superseded_by, @tags, @raw_message,
-         @message_id, @source_url, @source_file)
-    `),
-    convertParams({
+         @message_id, @source_url, @source_file)`
+    )
+    .run({
       content: fact.content,
       source: fact.source,
       source_type: fact.source_type,
@@ -267,69 +230,95 @@ export async function insertFact(fact: Omit<Fact, "id" | "created_at" | "updated
       message_id: fact.message_id ?? null,
       source_url: fact.source_url ?? null,
       source_file: fact.source_file ?? null,
-    })
-  );
-  const row = queryOne<{ id: number }>(db, "SELECT last_insert_rowid() as id");
-  const id = row!.id;
-  saveDb();
-  return id;
+    });
+  return Number(info.lastInsertRowid);
 }
 
 export async function getFact(id: number): Promise<Fact | null> {
   const db = await getDb();
-  const row = queryOne<FactRow>(db, sqlParams("SELECT * FROM facts WHERE id = @id"), convertParams({ id }));
+  const row = db.prepare("SELECT * FROM facts WHERE id = ?").get(id) as FactRow | undefined;
   return row ? deserializeFact(row) : null;
 }
 
 export async function getFactsByIds(ids: number[]): Promise<Fact[]> {
   if (ids.length === 0) return [];
   const db = await getDb();
-  // sql.js doesn't support array binds, so use IN with comma-joined ids (safe — all integers)
-  const rows = queryAll<FactRow>(
-    db,
-    `SELECT * FROM facts WHERE id IN (${ids.map((id) => Number(id)).join(",")})`
-  );
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT * FROM facts WHERE id IN (${placeholders})`)
+    .all(...ids) as FactRow[];
   return rows.map(deserializeFact);
 }
 
 export async function getActiveFacts(): Promise<Fact[]> {
   const db = await getDb();
-  const rows = queryAll<FactRow>(
-    db,
-    "SELECT * FROM facts WHERE valid_to IS NULL ORDER BY created_at DESC"
-  );
+  const rows = db
+    .prepare("SELECT * FROM facts WHERE valid_to IS NULL ORDER BY created_at DESC")
+    .all() as FactRow[];
   return rows.map(deserializeFact);
 }
 
 export async function expireFact(id: number, supersededById?: number): Promise<void> {
   const db = await getDb();
   const now = new Date().toISOString();
-  db.run(
-    sqlParams("UPDATE facts SET valid_to = @now, updated_at = @now, superseded_by = @sup WHERE id = @id"),
-    convertParams({ now, sup: supersededById ?? null, id })
-  );
-  saveDb();
+  db.prepare(
+    "UPDATE facts SET valid_to = @now, updated_at = @now, superseded_by = @sup WHERE id = @id"
+  ).run({ now, sup: supersededById ?? null, id });
 }
 
 export async function searchFacts(keyword: string, tags: string[] = [], limit = 20): Promise<Fact[]> {
   const db = await getDb();
-  const kw = `%${keyword.toLowerCase()}%`;
-  let query = "SELECT * FROM facts WHERE valid_to IS NULL AND (LOWER(content) LIKE @kw";
-  const params: Record<string, unknown> = { kw, limit };
+  const kw = keyword.trim();
 
-  if (tags.length > 0) {
-    const tagConditions = tags
-      .map((t, i) => {
-        params[`tag${i}`] = `%"${t}"%`;
-        return `tags LIKE @tag${i}`;
-      })
-      .join(" OR ");
-    query += ` OR ${tagConditions}`;
+  // No keyword → tag-only filter (fallback to base table), or empty list.
+  if (!kw) {
+    if (tags.length === 0) return [];
+    const tagClauses = tags.map((_, i) => `tags LIKE @tag${i}`).join(" OR ");
+    const params: Record<string, unknown> = { limit };
+    tags.forEach((t, i) => { params[`tag${i}`] = `%"${t}"%`; });
+    const rows = db
+      .prepare(
+        `SELECT * FROM facts
+         WHERE valid_to IS NULL AND (${tagClauses})
+         ORDER BY confidence DESC, created_at DESC
+         LIMIT @limit`
+      )
+      .all(params) as FactRow[];
+    return rows.map(deserializeFact);
   }
 
-  query += ") ORDER BY confidence DESC, created_at DESC LIMIT @limit";
-  const rows = queryAll<FactRow>(db, sqlParams(query), convertParams(params));
+  // FTS5 MATCH + bm25 ranking, joined back to facts for full row.
+  const matchExpr = ftsMatchExpression(kw);
+  const params: Record<string, unknown> = { match: matchExpr, limit };
+  let tagClause = "";
+  if (tags.length > 0) {
+    const ors = tags.map((_, i) => `f.tags LIKE @tag${i}`).join(" OR ");
+    tagClause = `OR (${ors})`;
+    tags.forEach((t, i) => { params[`tag${i}`] = `%"${t}"%`; });
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT f.*
+         FROM facts_fts
+         JOIN facts f ON f.id = facts_fts.rowid
+        WHERE f.valid_to IS NULL
+          AND (facts_fts MATCH @match ${tagClause})
+        ORDER BY bm25(facts_fts), f.confidence DESC, f.created_at DESC
+        LIMIT @limit`
+    )
+    .all(params) as FactRow[];
   return rows.map(deserializeFact);
+}
+
+// Quote each token so FTS5 operators (" ( ) *) are treated as literals.
+function ftsMatchExpression(kw: string): string {
+  const tokens = kw
+    .split(/\s+/)
+    .map((t) => t.replace(/"/g, '""'))
+    .filter(Boolean);
+  if (tokens.length === 0) return '""';
+  return tokens.map((t) => `"${t}"`).join(" ");
 }
 
 function deserializeFact(row: FactRow): Fact {
@@ -343,63 +332,50 @@ function deserializeFact(row: FactRow): Fact {
 
 export async function insertRelation(rel: FactRelation): Promise<void> {
   const db = await getDb();
-  db.run(
-    sqlParams(`
-      INSERT INTO fact_relations (fact_id, related_fact_id, relation_type, created_at)
-      VALUES (@fact_id, @related_fact_id, @relation_type, @created_at)
-    `),
-    convertParams({ ...rel, created_at: new Date().toISOString() })
-  );
-  saveDb();
+  db.prepare(
+    `INSERT INTO fact_relations (fact_id, related_fact_id, relation_type, created_at)
+     VALUES (@fact_id, @related_fact_id, @relation_type, @created_at)`
+  ).run({ ...rel, created_at: new Date().toISOString() });
 }
 
 // ── Consolidation log ─────────────────────────────────────────────────────────
 
 export async function logConsolidationPhase(entry: ConsolidationLogEntry): Promise<void> {
   const db = await getDb();
-  db.run(
-    sqlParams(`
-      INSERT INTO consolidation_log
-        (run_at, phase, facts_processed, facts_merged, facts_invalidated,
-         contradictions_found, duration_ms, notes)
-      VALUES
-        (@run_at, @phase, @facts_processed, @facts_merged, @facts_invalidated,
-         @contradictions_found, @duration_ms, @notes)
-    `),
-    convertParams({ ...entry } as Record<string, unknown>)
-  );
-  saveDb();
+  db.prepare(
+    `INSERT INTO consolidation_log
+       (run_at, phase, facts_processed, facts_merged, facts_invalidated,
+        contradictions_found, duration_ms, notes)
+     VALUES
+       (@run_at, @phase, @facts_processed, @facts_merged, @facts_invalidated,
+        @contradictions_found, @duration_ms, @notes)`
+  ).run({ ...entry } as Record<string, unknown>);
 }
 
-/** Count distinct consolidation runs (one per unique run_at in the log). */
 export async function getConsolidationRunCount(): Promise<number> {
   const db = await getDb();
-  const row = queryOne<{ n: number }>(
-    db,
-    "SELECT COUNT(DISTINCT run_at) as n FROM consolidation_log"
-  );
+  const row = db
+    .prepare("SELECT COUNT(DISTINCT run_at) as n FROM consolidation_log")
+    .get() as { n: number } | undefined;
   return row?.n ?? 0;
 }
 
 export async function getLastConsolidation(): Promise<string | null> {
   const db = await getDb();
-  const row = queryOne<{ run_at: string }>(
-    db,
-    "SELECT run_at FROM consolidation_log ORDER BY id DESC LIMIT 1"
-  );
+  const row = db
+    .prepare("SELECT run_at FROM consolidation_log ORDER BY id DESC LIMIT 1")
+    .get() as { run_at: string } | undefined;
   return row?.run_at ?? null;
 }
 
 export async function getFactCount(): Promise<{ active: number; expired: number }> {
   const db = await getDb();
-  const active = queryOne<{ n: number }>(
-    db,
-    "SELECT COUNT(*) as n FROM facts WHERE valid_to IS NULL"
-  )!.n;
-  const expired = queryOne<{ n: number }>(
-    db,
-    "SELECT COUNT(*) as n FROM facts WHERE valid_to IS NOT NULL"
-  )!.n;
+  const active = (db
+    .prepare("SELECT COUNT(*) as n FROM facts WHERE valid_to IS NULL")
+    .get() as { n: number }).n;
+  const expired = (db
+    .prepare("SELECT COUNT(*) as n FROM facts WHERE valid_to IS NOT NULL")
+    .get() as { n: number }).n;
   return { active, expired };
 }
 
@@ -435,60 +411,51 @@ export async function insertDriftFinding(
   finding: Omit<DriftFinding, "id" | "addressed" | "addressed_at">
 ): Promise<number> {
   const db = await getDb();
-  db.run(
-    sqlParams(`
-      INSERT INTO drift_findings (run_at, fact_id, consistent, evidence, question, addressed)
-      VALUES (@run_at, @fact_id, @consistent, @evidence, @question, 0)
-    `),
-    convertParams({
+  const info = db
+    .prepare(
+      `INSERT INTO drift_findings (run_at, fact_id, consistent, evidence, question, addressed)
+       VALUES (@run_at, @fact_id, @consistent, @evidence, @question, 0)`
+    )
+    .run({
       run_at: finding.run_at,
       fact_id: finding.fact_id,
       consistent: finding.consistent ? 1 : 0,
       evidence: finding.evidence ?? null,
       question: finding.question ?? null,
-    })
-  );
-  const row = queryOne<{ id: number }>(db, "SELECT last_insert_rowid() as id");
-  saveDb();
-  return row!.id;
+    });
+  return Number(info.lastInsertRowid);
 }
 
 export async function getDriftFindings(runAt?: string): Promise<DriftFinding[]> {
   const db = await getDb();
   if (runAt) {
-    return queryAll<DriftFindingRow>(
-      db,
-      sqlParams("SELECT * FROM drift_findings WHERE run_at = @run_at ORDER BY id"),
-      convertParams({ run_at: runAt })
-    ).map(deserializeDriftFinding);
+    return (db
+      .prepare("SELECT * FROM drift_findings WHERE run_at = ? ORDER BY id")
+      .all(runAt) as DriftFindingRow[]).map(deserializeDriftFinding);
   }
-  // Latest run
-  const latest = queryOne<{ run_at: string }>(
-    db,
-    "SELECT run_at FROM drift_findings ORDER BY id DESC LIMIT 1"
-  );
+  const latest = db
+    .prepare("SELECT run_at FROM drift_findings ORDER BY id DESC LIMIT 1")
+    .get() as { run_at: string } | undefined;
   if (!latest) return [];
-  return queryAll<DriftFindingRow>(
-    db,
-    sqlParams("SELECT * FROM drift_findings WHERE run_at = @run_at ORDER BY id"),
-    convertParams({ run_at: latest.run_at })
-  ).map(deserializeDriftFinding);
+  return (db
+    .prepare("SELECT * FROM drift_findings WHERE run_at = ? ORDER BY id")
+    .all(latest.run_at) as DriftFindingRow[]).map(deserializeDriftFinding);
 }
 
 export async function getUnansweredQuestions(): Promise<DriftFinding[]> {
   const db = await getDb();
-  return queryAll<DriftFindingRow>(
-    db,
-    "SELECT * FROM drift_findings WHERE addressed = 0 AND question IS NOT NULL ORDER BY run_at DESC, id"
-  ).map(deserializeDriftFinding);
+  return (db
+    .prepare(
+      "SELECT * FROM drift_findings WHERE addressed = 0 AND question IS NOT NULL ORDER BY run_at DESC, id"
+    )
+    .all() as DriftFindingRow[]).map(deserializeDriftFinding);
 }
 
 export async function addressDriftFinding(id: number): Promise<void> {
   const db = await getDb();
   const now = new Date().toISOString();
-  db.run(
-    sqlParams("UPDATE drift_findings SET addressed = 1, addressed_at = @now WHERE id = @id"),
-    convertParams({ now, id })
-  );
-  saveDb();
+  db.prepare("UPDATE drift_findings SET addressed = 1, addressed_at = @now WHERE id = @id").run({
+    now,
+    id,
+  });
 }

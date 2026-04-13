@@ -21,7 +21,12 @@ If the message is a bare greeting or acknowledgment only, skip the tool call.
 
 ## Retrieval
 
-When the user asks about previous context, call `context-agent__storage_query` with a keyword.
+When the user asks about previous context or project knowledge, call `context-agent__retrieve_context` with the user's question.
+This searches the knowledge base, ranks results by relevance, and returns an attributed context block.
+Use the context block to formulate your answer — always cite sources and dates from the attribution.
+
+For raw fact lookups by keyword or tags, use `context-agent__storage_query`.
+
 When asked for status, call `context-agent__get_status`.
 When asked to consolidate, call `context-agent__consolidate`.
 When asked to sync, publish, or push context to the target repo, call `context-agent__sync_repo`.
@@ -36,6 +41,7 @@ When asked to sync, publish, or push context to the target repo, call `context-a
 | `/drift_report` | Call `context-agent__get_drift_report` — show latest findings and open questions |
 | `/resolve <id>` | Call `context-agent__resolve_drift_finding` with finding_id — mark a drift finding as addressed |
 | `/facts [keyword]` | Call `context-agent__storage_query` |
+| `/ask <question>` | Call `context-agent__retrieve_context` — answer from the knowledge base |
 | `/status` | Call `context-agent__get_status` |
 
 ## Source Attribution Format

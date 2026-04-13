@@ -19,9 +19,17 @@ services:
     volumes:
       - ./data/openclaw-config:/home/node/.openclaw
       - ./skills:/home/node/.openclaw/workspace/skills
+      - /home/node/.openclaw/workspace/skills/context-agent/node_modules
       - ./AGENTS.md:/home/node/.openclaw/workspace/AGENTS.md:ro
       - ./SOUL.md:/home/node/.openclaw/workspace/SOUL.md:ro
       - ./data/context-data:/home/node/.openclaw/workspace/skills/context-agent/data
+      - ./tools/gateway-healthcheck.sh:/usr/local/bin/gateway-healthcheck.sh:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gateway-healthcheck.sh"]
+      interval: 60s
+      timeout: 15s
+      start_period: 45s
+      retries: 3
 
   openclaw-cli:
     image: ghcr.io/openclaw/openclaw:latest

@@ -10,7 +10,7 @@ import { extractUrls } from "./url-fetch.js";
 import { insertFact, searchFacts, addressDriftFinding, type Fact, type SourceType, type Confidence } from "./storage.js";
 import { runConsolidation, normalize, contentOverlaps, type ConsolidationSummary } from "./consolidation.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
-import { retrieve, getStatus } from "./retrieval.js";
+import { retrieve, getStatus, type RetrievalResult } from "./retrieval.js";
 import type { ExtractedFact } from "./llm-extract.js";
 
 // Confidence defaults per entry type
@@ -225,6 +225,15 @@ export async function sync_repo(): Promise<RepoSyncResult> {
 
 export async function get_status(): Promise<{ status: string }> {
   return { status: await getStatus() };
+}
+
+// ── Tool: retrieve_context ───────────────────────────────────────────────────
+
+export async function retrieve_context(args: {
+  question: string;
+  limit?: number;
+}): Promise<RetrievalResult> {
+  return retrieve(args.question, args.limit);
 }
 
 // ── Tool: run_drift_analysis ─────────────────────────────────────────────────

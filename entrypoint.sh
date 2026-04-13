@@ -3,15 +3,15 @@ set -e
 
 CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-/home/node/.openclaw}"
 
-# Build skill: install deps + compile TypeScript (no native addons — sql.js is pure WASM)
+# Build skill: install deps (better-sqlite3 native addon) + compile TypeScript.
+# node_modules is on an anonymous volume so the container's linux binary
+# stays isolated from the host's. pnpm/tsc are idempotent — run every start.
 SKILL_DIR="$CONFIG_DIR/workspace/skills/context-agent"
-SKILL_SENTINEL="$SKILL_DIR/.built"
-if [ -d "$SKILL_DIR" ] && [ ! -f "$SKILL_SENTINEL" ]; then
+if [ -d "$SKILL_DIR" ]; then
   echo "[entrypoint] Building context-agent skill..."
   cd "$SKILL_DIR"
   CI=true pnpm install --store-dir /tmp/pnpm-store 2>&1
   pnpm run build 2>&1
-  touch "$SKILL_SENTINEL"
 fi
 
 # Register context-agent MCP server (idempotent — overwrites if exists).

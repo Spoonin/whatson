@@ -8,6 +8,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import Anthropic from "@anthropic-ai/sdk";
 import {
   getActiveFacts,
   expireFact,
@@ -16,7 +17,9 @@ import {
   getLastConsolidation,
   getConsolidationRunCount,
   getFactCount,
+  searchFacts,
   type Fact,
+  type RelationType,
 } from "./storage.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
 import { runDriftAnalysis, formatDriftSummary, type DriftAnalysisResult } from "./drift.js";
@@ -115,11 +118,308 @@ interface ConsolidateResult {
   contradictions: number;
 }
 
-async function consolidate(newFacts: Fact[], allFacts: Fact[]): Promise<ConsolidateResult> {
+// ── Anthropic client (lazy singleton, same pattern as llm-extract.ts) ────────
+
+let _client: Anthropic | null = null;
+
+function getClient(): Anthropic | null {
+  if (_client) return _client;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+  _client = new Anthropic({ apiKey });
+  return _client;
+}
+
+/** Override client for testing */
+export function _setClientForTest(client: Anthropic | null): void {
+  _client = client;
+}
+
+// ── LLM consolidation types ─────────────────────────────────────────────────
+
+export interface ConsolidationAction {
+  action: "merge" | "contradict" | "relate" | "keep";
+  keep?: number;
+  expire?: number[];
+  ids?: number[];
+  relation?: string;
+  reason?: string;
+  id?: number;
+}
+
+// ── Clustering: group facts by FTS5 similarity + tag overlap ────────────────
+
+const MAX_CLUSTER_SIZE = 20;
+
+const STOP_WORDS = new Set([
+  "the", "a", "an", "in", "on", "at", "to", "for", "of", "with", "by",
+  "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+  "what", "how", "when", "where", "why", "which", "that", "this", "from",
+  "not", "but", "about", "our", "will", "use", "used", "using",
+]);
+
+function extractSignificantWords(text: string): string[] {
+  return [...new Set(
+    text.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/)
+      .filter((w) => w.length > 3 && !STOP_WORDS.has(w)),
+  )].slice(0, 5);
+}
+
+export async function clusterFacts(
+  newFacts: Fact[],
+  allFacts: Fact[],
+  processed: Set<number>,
+): Promise<Fact[][]> {
+  const allById = new Map(allFacts.map((f) => [f.id!, f]));
+  const clusters: Fact[][] = [];
+
+  for (const fact of newFacts) {
+    if (processed.has(fact.id!)) continue;
+
+    const clusterIds = new Set<number>([fact.id!]);
+
+    // FTS5 search per keyword (like retrieval.ts does)
+    const words = extractSignificantWords(fact.content);
+    for (const word of words) {
+      if (clusterIds.size >= MAX_CLUSTER_SIZE) break;
+      const results = await searchFacts(word, [], 10);
+      for (const r of results) {
+        if (clusterIds.size >= MAX_CLUSTER_SIZE) break;
+        if (!processed.has(r.id!) && allById.has(r.id!)) {
+          clusterIds.add(r.id!);
+        }
+      }
+    }
+
+    // Supplement: tag overlap
+    if (fact.tags.length > 0) {
+      for (const other of allFacts) {
+        if (clusterIds.size >= MAX_CLUSTER_SIZE) break;
+        if (processed.has(other.id!) || clusterIds.has(other.id!)) continue;
+        if (other.tags.some((t) => fact.tags.includes(t))) {
+          clusterIds.add(other.id!);
+        }
+      }
+    }
+
+    // Only worth an LLM call if there's more than just the new fact itself
+    if (clusterIds.size > 1) {
+      const cluster = [...clusterIds]
+        .map((id) => allById.get(id))
+        .filter((f): f is Fact => f !== undefined);
+      clusters.push(cluster);
+    }
+  }
+
+  return clusters;
+}
+
+// ── LLM prompt ──────────────────────────────────────────────────────────────
+
+const CONSOLIDATION_PROMPT = `You are a knowledge base consolidation agent. You are given a cluster of facts from a project knowledge base. Each fact has an ID, content, type, confidence, and date.
+
+Your task is to analyze the cluster and identify:
+
+1. **Duplicates** — facts that express the same information in different words. Keep the most complete/recent version. Expire the others.
+
+2. **Contradictions** — facts that make conflicting claims about the same topic. Keep the most recent or most authoritative (higher confidence). Expire the contradicted fact. If you cannot determine which is correct, keep both.
+
+3. **Relations** — facts that support or are related to each other but are not duplicates. Link them.
+
+Rules:
+- A "correction" type always supersedes a non-correction on the same topic.
+- Higher confidence supersedes lower confidence, all else equal.
+- More recent supersedes older, all else equal.
+- When in doubt, keep both facts — false merges lose data, false keeps do not.
+- Do NOT invent new facts or modify existing fact text.
+
+Respond ONLY with a JSON array of actions (no markdown fences, no explanation):
+
+[
+  {"action": "merge", "keep": 5, "expire": [3], "reason": "Same decision about PostgreSQL"},
+  {"action": "contradict", "keep": 12, "expire": [2], "reason": "Correction supersedes original"},
+  {"action": "relate", "ids": [5, 14], "relation": "supports", "reason": "Both about DB choice"},
+  {"action": "keep", "id": 7}
+]
+
+If no actions are needed, respond with: []`;
+
+// ── LLM call for one cluster ────────────────────────────────────────────────
+
+async function consolidateClusterLlm(cluster: Fact[]): Promise<ConsolidationAction[]> {
+  const client = getClient();
+  if (!client) return [];
+
+  const factsBlock = cluster
+    .map((f) => `- ID:${f.id} [${f.source_type}] (confidence:${f.confidence}, date:${f.valid_from.slice(0, 10)}) "${f.content}"`)
+    .join("\n");
+
+  try {
+    const response = await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1024,
+      system: CONSOLIDATION_PROMPT,
+      messages: [{ role: "user", content: `Analyze this cluster:\n\n${factsBlock}` }],
+    });
+
+    const content = response.content[0];
+    if (content.type !== "text") return [];
+
+    const validIds = new Set(cluster.map((f) => f.id!));
+    return parseConsolidationResponse(content.text, validIds);
+  } catch (err) {
+    console.error("[consolidation] LLM call failed, skipping cluster:", err);
+    return [];
+  }
+}
+
+// ── Response parsing (defensive, same pattern as llm-extract.ts) ────────────
+
+const VALID_ACTIONS = new Set(["merge", "contradict", "relate", "keep"]);
+const VALID_RELATIONS: Set<string> = new Set(["contradicts", "supports", "supersedes", "related"]);
+
+export function parseConsolidationResponse(
+  text: string,
+  validIds: Set<number>,
+): ConsolidationAction[] {
+  let jsonStr = text.trim();
+
+  // Strip markdown code fences
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) jsonStr = fenceMatch[1].trim();
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(jsonStr);
+  } catch {
+    const arrayMatch = jsonStr.match(/\[[\s\S]*\]/);
+    if (!arrayMatch) return [];
+    try {
+      raw = JSON.parse(arrayMatch[0]);
+    } catch {
+      return [];
+    }
+  }
+
+  if (!Array.isArray(raw)) return [];
+
+  const results: ConsolidationAction[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const a = item as Record<string, unknown>;
+
+    if (!VALID_ACTIONS.has(a.action as string)) continue;
+    const action = a.action as ConsolidationAction["action"];
+
+    if (action === "merge" || action === "contradict") {
+      const keep = Number(a.keep);
+      const expire = Array.isArray(a.expire) ? a.expire.map(Number).filter(Number.isFinite) : [];
+      if (!validIds.has(keep) || expire.length === 0) continue;
+      if (expire.some((id) => !validIds.has(id))) continue;
+      if (expire.includes(keep)) continue;
+      results.push({ action, keep, expire, reason: String(a.reason ?? "") });
+    } else if (action === "relate") {
+      const ids = Array.isArray(a.ids) ? a.ids.map(Number).filter(Number.isFinite) : [];
+      if (ids.length < 2 || ids.some((id) => !validIds.has(id))) continue;
+      const relation = VALID_RELATIONS.has(a.relation as string) ? (a.relation as string) : "related";
+      results.push({ action, ids, relation, reason: String(a.reason ?? "") });
+    }
+    // "keep" actions are no-ops — skip them silently
+  }
+
+  return results;
+}
+
+// ── Execute LLM actions ─────────────────────────────────────────────────────
+
+async function executeActions(
+  actions: ConsolidationAction[],
+  processed: Set<number>,
+): Promise<{ merged: number; contradictions: number }> {
   let merged = 0;
   let contradictions = 0;
 
+  for (const a of actions) {
+    if (a.action === "merge" && a.keep && a.expire) {
+      for (const expId of a.expire) {
+        if (processed.has(expId)) continue;
+        await expireFact(expId, a.keep);
+        await insertRelation({
+          fact_id: a.keep,
+          related_fact_id: expId,
+          relation_type: "supersedes",
+        });
+        processed.add(expId);
+        merged++;
+      }
+    } else if (a.action === "contradict" && a.keep && a.expire) {
+      for (const expId of a.expire) {
+        if (processed.has(expId)) continue;
+        await expireFact(expId, a.keep);
+        await insertRelation({
+          fact_id: a.keep,
+          related_fact_id: expId,
+          relation_type: "contradicts",
+        });
+        processed.add(expId);
+        contradictions++;
+      }
+    } else if (a.action === "relate" && a.ids && a.ids.length >= 2) {
+      const relation = (a.relation as RelationType) ?? "related";
+      for (let i = 1; i < a.ids.length; i++) {
+        await insertRelation({
+          fact_id: a.ids[0],
+          related_fact_id: a.ids[i],
+          relation_type: relation,
+        });
+      }
+    }
+  }
+
+  return { merged, contradictions };
+}
+
+// ── Main consolidate: LLM path with heuristic fallback ─────────────────────
+
+async function consolidate(newFacts: Fact[], allFacts: Fact[]): Promise<ConsolidateResult> {
   const processed = new Set<number>();
+  let totalMerged = 0;
+  let totalContradictions = 0;
+
+  // Try LLM path
+  const client = getClient();
+  if (client && newFacts.length > 0) {
+    const clusters = await clusterFacts(newFacts, allFacts, processed);
+
+    for (const cluster of clusters) {
+      // Skip clusters where all facts are already processed
+      const live = cluster.filter((f) => !processed.has(f.id!));
+      if (live.length < 2) continue;
+
+      const actions = await consolidateClusterLlm(live);
+      const { merged, contradictions } = await executeActions(actions, processed);
+      totalMerged += merged;
+      totalContradictions += contradictions;
+    }
+  }
+
+  // Heuristic fallback for any new facts not covered by LLM clusters
+  const heuristic = await consolidateHeuristic(newFacts, allFacts, processed);
+  totalMerged += heuristic.merged;
+  totalContradictions += heuristic.contradictions;
+
+  return { merged: totalMerged, contradictions: totalContradictions };
+}
+
+// ── Heuristic consolidation (original logic, now fallback) ──────────────────
+
+async function consolidateHeuristic(
+  newFacts: Fact[],
+  allFacts: Fact[],
+  processed: Set<number>,
+): Promise<ConsolidateResult> {
+  let merged = 0;
+  let contradictions = 0;
 
   for (const fact of newFacts) {
     if (processed.has(fact.id!)) continue;
@@ -128,12 +428,10 @@ async function consolidate(newFacts: Fact[], allFacts: Fact[]): Promise<Consolid
       if (other.id === fact.id) continue;
       if (processed.has(other.id!)) continue;
 
-      // Duplicate detection — same content, same source_type
       if (
         normalize(fact.content) === normalize(other.content) &&
         fact.source_type === other.source_type
       ) {
-        // Keep newer, expire older
         const [keep, expire] =
           fact.created_at >= other.created_at
             ? [fact, other]
@@ -150,7 +448,6 @@ async function consolidate(newFacts: Fact[], allFacts: Fact[]): Promise<Consolid
         continue;
       }
 
-      // Contradiction detection — same topic, conflicting types
       if (
         fact.source_type === "correction" &&
         other.source_type !== "correction" &&

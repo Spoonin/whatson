@@ -10,7 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status, run_drift_analysis, get_drift_report, resolve_drift_finding } from "./index.js";
+import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status, retrieve_context, run_drift_analysis, get_drift_report, resolve_drift_finding } from "./index.js";
 
 const server = new McpServer({
   name: "context-agent",
@@ -155,6 +155,33 @@ server.tool(
     return {
       content: [{ type: "text", text: result.status }],
     };
+  }
+);
+
+// ── Tool: retrieve_context ─────────────────────────────────────────────────
+
+server.tool(
+  "retrieve_context",
+  "Answer a natural language question using the knowledge base. Extracts keywords, searches via FTS5, ranks by relevance/confidence/recency, and returns an attributed context block. Use this when the user asks a question about previously recorded project knowledge.",
+  {
+    question: z.string().describe("The user's question in natural language"),
+    limit:    z.number().optional().describe("Max facts to consider (default 20)"),
+  },
+  async (params) => {
+    const result = await retrieve_context({
+      question: params.question,
+      limit:    params.limit,
+    });
+    const parts: Array<{ type: "text"; text: string }> = [
+      { type: "text", text: result.contextBlock },
+    ];
+    if (result.truncated) {
+      parts.push({ type: "text", text: "\n(Results truncated to fit token budget)" });
+    }
+    if (result.facts.length === 0) {
+      parts.push({ type: "text", text: "No matching facts found in the knowledge base." });
+    }
+    return { content: parts };
   }
 );
 

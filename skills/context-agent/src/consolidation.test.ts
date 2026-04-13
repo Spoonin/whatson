@@ -9,7 +9,14 @@ import {
   getLastConsolidation,
   type Fact,
 } from "./storage.js";
-import { runConsolidation } from "./consolidation.js";
+import {
+  runConsolidation,
+  normalize,
+  contentOverlaps,
+  parseConsolidationResponse,
+  clusterFacts,
+  _setClientForTest,
+} from "./consolidation.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -290,5 +297,305 @@ describe("consolidation sync gating", () => {
     await insertFact(makeFact());
     const summary = await runConsolidation();
     expect((summary.repoSync as { skipped: string }).skipped).toBe("TARGET_REPO not configured");
+  });
+});
+
+// ── parseConsolidationResponse ─────────────────────────────────────────────
+
+describe("parseConsolidationResponse", () => {
+  const validIds = new Set([1, 2, 3, 5, 8, 14]);
+
+  it("parses a valid merge action", () => {
+    const json = JSON.stringify([
+      { action: "merge", keep: 5, expire: [3], reason: "Same fact" },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ action: "merge", keep: 5, expire: [3] });
+  });
+
+  it("parses a valid contradict action", () => {
+    const json = JSON.stringify([
+      { action: "contradict", keep: 2, expire: [1], reason: "Correction" },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ action: "contradict", keep: 2, expire: [1] });
+  });
+
+  it("parses a valid relate action", () => {
+    const json = JSON.stringify([
+      { action: "relate", ids: [5, 14], relation: "supports", reason: "Both about DB" },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ action: "relate", ids: [5, 14], relation: "supports" });
+  });
+
+  it("silently skips keep actions (no-ops)", () => {
+    const json = JSON.stringify([
+      { action: "keep", id: 3 },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(0);
+  });
+
+  it("rejects actions with unknown fact IDs", () => {
+    const json = JSON.stringify([
+      { action: "merge", keep: 5, expire: [999], reason: "Hallucinated ID" },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(0);
+  });
+
+  it("rejects merge where keep === expire", () => {
+    const json = JSON.stringify([
+      { action: "merge", keep: 5, expire: [5], reason: "Self-merge" },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(0);
+  });
+
+  it("rejects actions with invalid action type", () => {
+    const json = JSON.stringify([
+      { action: "delete", id: 3 },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(0);
+  });
+
+  it("extracts JSON from markdown code fences", () => {
+    const text = '```json\n[{"action":"merge","keep":5,"expire":[3],"reason":"dup"}]\n```';
+    const actions = parseConsolidationResponse(text, validIds);
+    expect(actions).toHaveLength(1);
+  });
+
+  it("returns empty for completely invalid input", () => {
+    expect(parseConsolidationResponse("not json at all", validIds)).toEqual([]);
+    expect(parseConsolidationResponse("", validIds)).toEqual([]);
+    expect(parseConsolidationResponse("{}", validIds)).toEqual([]);
+  });
+
+  it("preserves valid actions when mixed with invalid", () => {
+    const json = JSON.stringify([
+      { action: "merge", keep: 5, expire: [3], reason: "Valid" },
+      { action: "merge", keep: 999, expire: [1], reason: "Bad ID" },
+      { action: "relate", ids: [1, 2], relation: "supports", reason: "Valid" },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(2);
+    expect(actions[0].action).toBe("merge");
+    expect(actions[1].action).toBe("relate");
+  });
+
+  it("defaults to 'related' for unknown relation types", () => {
+    const json = JSON.stringify([
+      { action: "relate", ids: [1, 2], relation: "similar_to" },
+    ]);
+    const actions = parseConsolidationResponse(json, validIds);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].relation).toBe("related");
+  });
+});
+
+// ── clusterFacts ───────────────────────────────────────────────────────────
+
+describe("clusterFacts", () => {
+  beforeEach(async () => {
+    await _setDbForTest();
+  });
+
+  it("groups facts that share keywords via FTS5", async () => {
+    const id1 = await insertFact(makeFact({ content: "We decided to use PostgreSQL for the database" }));
+    const id2 = await insertFact(makeFact({ content: "Database choice: PostgreSQL is confirmed" }));
+    const id3 = await insertFact(makeFact({ content: "Telegram bot is running on port 443" }));
+
+    const allFacts = await getActiveFacts();
+    const newFacts = allFacts.filter((f) => f.id === id1);
+    const processed = new Set<number>();
+
+    const clusters = await clusterFacts(newFacts, allFacts, processed);
+    expect(clusters.length).toBeGreaterThanOrEqual(1);
+
+    // The PostgreSQL cluster should contain id1 and id2 but not id3
+    const pgCluster = clusters.find((c) => c.some((f) => f.id === id1));
+    expect(pgCluster).toBeDefined();
+    expect(pgCluster!.some((f) => f.id === id2)).toBe(true);
+    expect(pgCluster!.some((f) => f.id === id3)).toBe(false);
+  });
+
+  it("supplements with tag overlap", async () => {
+    const id1 = await insertFact(makeFact({
+      content: "Runtime is Docker",
+      tags: ["infrastructure"],
+    }));
+    const id2 = await insertFact(makeFact({
+      content: "Kubernetes will be used for orchestration",
+      tags: ["infrastructure"],
+    }));
+
+    const allFacts = await getActiveFacts();
+    const newFacts = allFacts.filter((f) => f.id === id1);
+    const processed = new Set<number>();
+
+    const clusters = await clusterFacts(newFacts, allFacts, processed);
+    const cluster = clusters.find((c) => c.some((f) => f.id === id1));
+    expect(cluster).toBeDefined();
+    expect(cluster!.some((f) => f.id === id2)).toBe(true);
+  });
+
+  it("skips already-processed facts", async () => {
+    const id1 = await insertFact(makeFact({ content: "PostgreSQL is the database" }));
+    const id2 = await insertFact(makeFact({ content: "PostgreSQL confirmed as database" }));
+
+    const allFacts = await getActiveFacts();
+    const processed = new Set<number>([id1]);
+
+    const clusters = await clusterFacts(allFacts, allFacts, processed);
+    // id1 is processed → should not be a seed for a cluster
+    const hasId1AsSeed = clusters.some((c) => c[0]?.id === id1 && c.length === 1);
+    expect(hasId1AsSeed).toBe(false);
+  });
+
+  it("returns empty for single-fact clusters", async () => {
+    await insertFact(makeFact({ content: "Very unique standalone fact about quantum computing" }));
+
+    const allFacts = await getActiveFacts();
+    const processed = new Set<number>();
+
+    const clusters = await clusterFacts(allFacts, allFacts, processed);
+    // Single fact with no FTS5 or tag matches → no cluster (need at least 2)
+    expect(clusters.every((c) => c.length >= 2)).toBe(true);
+  });
+});
+
+// ── LLM consolidation (mocked client) ──────────────────────────────────────
+
+describe("LLM consolidation", () => {
+  beforeEach(async () => {
+    await _setDbForTest();
+  });
+
+  afterEach(() => {
+    _setClientForTest(null);
+  });
+
+  it("merges semantic duplicates via LLM", async () => {
+    // Mock Anthropic client that returns a merge action
+    const mockClient = {
+      messages: {
+        create: async (_params: unknown) => ({
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify([]),
+          }],
+        }),
+      },
+    };
+
+    const id1 = await insertFact(makeFact({
+      content: "We decided to use PostgreSQL for the database",
+      source_type: "decision",
+    }));
+    const id2 = await insertFact(makeFact({
+      content: "Database choice: PostgreSQL is confirmed",
+      source_type: "decision",
+    }));
+
+    // Set up mock that returns merge action for these IDs
+    mockClient.messages.create = async (params: unknown) => {
+      const p = params as { messages: { content: string }[] };
+      const text = p.messages[0].content;
+      // Extract the IDs from the prompt to return correct merge action
+      const idMatches = [...text.matchAll(/ID:(\d+)/g)].map((m) => Number(m[1]));
+      if (idMatches.length >= 2) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify([
+              { action: "merge", keep: idMatches[1], expire: [idMatches[0]], reason: "Same PostgreSQL decision" },
+            ]),
+          }],
+        };
+      }
+      return { content: [{ type: "text" as const, text: "[]" }] };
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    _setClientForTest(mockClient as any);
+
+    const summary = await runConsolidation();
+    expect(summary.factsMerged).toBeGreaterThanOrEqual(1);
+
+    const active = await getActiveFacts();
+    expect(active).toHaveLength(1);
+  });
+
+  it("falls back to heuristic when no API key", async () => {
+    _setClientForTest(null);
+
+    // Exact duplicates should still be caught by heuristic fallback
+    await insertFact(makeFact({ content: "We use Docker", source_type: "fact" }));
+    await insertFact(makeFact({ content: "We use Docker", source_type: "fact" }));
+
+    const summary = await runConsolidation();
+    expect(summary.factsMerged).toBeGreaterThanOrEqual(1);
+  });
+
+  it("falls back to heuristic when LLM call fails", async () => {
+    const failClient = {
+      messages: {
+        create: async () => { throw new Error("API down"); },
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    _setClientForTest(failClient as any);
+
+    // Exact duplicates caught by heuristic fallback
+    await insertFact(makeFact({ content: "Docker is the runtime", source_type: "fact" }));
+    await insertFact(makeFact({ content: "Docker is the runtime", source_type: "fact" }));
+
+    const summary = await runConsolidation();
+    expect(summary.factsMerged).toBeGreaterThanOrEqual(1);
+  });
+
+  it("detects contradiction via LLM", async () => {
+    const id1 = await insertFact(makeFact({
+      content: "We use Redis for caching",
+      source_type: "fact",
+    }));
+    const id2 = await insertFact(makeFact({
+      content: "Memcached is our caching layer",
+      source_type: "fact",
+    }));
+
+    const mockClient = {
+      messages: {
+        create: async (params: unknown) => {
+          const p = params as { messages: { content: string }[] };
+          const text = p.messages[0].content;
+          const idMatches = [...text.matchAll(/ID:(\d+)/g)].map((m) => Number(m[1]));
+          if (idMatches.length >= 2) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify([
+                  { action: "contradict", keep: idMatches[1], expire: [idMatches[0]], reason: "Conflicting caching choice" },
+                ]),
+              }],
+            };
+          }
+          return { content: [{ type: "text" as const, text: "[]" }] };
+        },
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    _setClientForTest(mockClient as any);
+
+    const summary = await runConsolidation();
+    expect(summary.contradictionsFound).toBeGreaterThanOrEqual(1);
+
+    const active = await getActiveFacts();
+    expect(active).toHaveLength(1);
   });
 });
