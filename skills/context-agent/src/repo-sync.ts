@@ -91,11 +91,34 @@ function authUrl(repo: string, token?: string): string {
   return repo;
 }
 
+/** Strip any injected `x-access-token:…@` credentials from an https URL. */
+function stripAuth(url: string): string {
+  return url.replace(/^(https:\/\/)[^@/]+@/, "$1");
+}
+
 /** Clone the target repo if not present, otherwise fetch + reset to origin HEAD. */
 function ensureCheckout(cfg: RepoSyncConfig): void {
   const gitDir = path.join(cfg.workDir, ".git");
 
   if (fs.existsSync(gitDir)) {
+    // If the existing checkout points at a different remote (e.g. TARGET_REPO
+    // was changed), wipe it and re-clone. Otherwise we'd silently keep
+    // pushing to the old repo.
+    let currentRemote = "";
+    try {
+      currentRemote = git(["remote", "get-url", "origin"], cfg.workDir).trim();
+    } catch {
+      // no origin — treat as stale
+    }
+    if (stripAuth(currentRemote) !== stripAuth(cfg.targetRepo)) {
+      fs.rmSync(cfg.workDir, { recursive: true, force: true });
+      fs.mkdirSync(path.dirname(cfg.workDir), { recursive: true });
+      const url = authUrl(cfg.targetRepo, cfg.githubToken);
+      execFileSync("git", ["clone", url, cfg.workDir], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return;
+    }
     git(["fetch", "origin"], cfg.workDir);
     // Determine default branch from origin HEAD; fall back to main/master.
     let ref = "origin/HEAD";

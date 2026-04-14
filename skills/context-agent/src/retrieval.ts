@@ -11,16 +11,20 @@
  * 7. Format with source attribution per fact
  */
 
-import { searchFacts, searchFactsByVector, getFactsByIds, hasVecSupport, type Fact } from "./storage.js";
+import { searchFacts, searchFactsByVector, getFactsByIds, searchDocuments, hasVecSupport, type Fact, type Document } from "./storage.js";
 import { embedText } from "./embeddings.js";
 
 const TOKEN_BUDGET = 2000;
 // Rough estimate: 1 token ≈ 4 chars
 const CHAR_BUDGET = TOKEN_BUDGET * 4;
+// Per-document excerpt cap inside the context block. Full content is always
+// returned separately via `documents` so callers can re-read verbatim.
+const DOC_EXCERPT_CHARS = 1200;
 
 export interface RetrievalResult {
   contextBlock: string;
   facts: AttributedFact[];
+  documents: AttributedDocument[];
   truncated: boolean;
 }
 
@@ -32,6 +36,16 @@ export interface AttributedFact {
   confidence: string;
   date: string;
   attribution: string;
+}
+
+export interface AttributedDocument {
+  id: number;
+  source: string;
+  source_file: string | null;
+  source_url: string | null;
+  date: string;
+  excerpt: string;
+  content: string;
 }
 
 // ── Keyword extraction ────────────────────────────────────────────────────────
@@ -78,7 +92,10 @@ function formatAttribution(fact: Fact): string {
 
 // ── Context block builder ────────────────────────────────────────────────────
 
-function buildContextBlock(facts: AttributedFact[]): { block: string; truncated: boolean } {
+function buildContextBlock(
+  facts: AttributedFact[],
+  documents: AttributedDocument[],
+): { block: string; truncated: boolean } {
   const lines: string[] = [
     "## Relevant Context",
     "",
@@ -95,6 +112,21 @@ function buildContextBlock(facts: AttributedFact[]): { block: string; truncated:
     }
     lines.push(line);
     charCount += line.length + 1;
+  }
+
+  if (documents.length > 0 && !truncated) {
+    lines.push("", "## Source Documents", "");
+    charCount += "\n## Source Documents\n\n".length;
+    for (const d of documents) {
+      const header = `### ${d.source_file ?? d.source_url ?? d.source} (${d.date}, doc#${d.id})`;
+      const block = `${header}\n${d.excerpt}\n`;
+      if (charCount + block.length > CHAR_BUDGET) {
+        truncated = true;
+        break;
+      }
+      lines.push(header, d.excerpt, "");
+      charCount += block.length;
+    }
   }
 
   return { block: lines.join("\n"), truncated };
@@ -192,11 +224,36 @@ export async function retrieve(question: string, limit = 20): Promise<RetrievalR
     attribution: formatAttribution(f),
   }));
 
-  const { block, truncated } = buildContextBlock(attributed);
+  // ── Document search ──
+  // Run the same keywords against the documents FTS so that details which
+  // were never extracted as discrete facts (e.g. a roadmap bullet from a
+  // PRD) can still be surfaced verbatim to the caller.
+  const docMap = new Map<number, Document>();
+  for (const kw of keywords.slice(0, 5)) {
+    for (const d of await searchDocuments(kw, Math.min(limit, 5))) {
+      if (d.id !== undefined && !docMap.has(d.id)) docMap.set(d.id, d);
+    }
+  }
+  const attributedDocs: AttributedDocument[] = [...docMap.values()]
+    .slice(0, 5)
+    .map((d) => ({
+      id: d.id!,
+      source: d.source,
+      source_file: d.source_file,
+      source_url: d.source_url,
+      date: d.created_at.slice(0, 10),
+      excerpt: d.content.length > DOC_EXCERPT_CHARS
+        ? d.content.slice(0, DOC_EXCERPT_CHARS) + "…"
+        : d.content,
+      content: d.content,
+    }));
+
+  const { block, truncated } = buildContextBlock(attributed, attributedDocs);
 
   return {
     contextBlock: block,
     facts: attributed,
+    documents: attributedDocs,
     truncated,
   };
 }

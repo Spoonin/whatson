@@ -7,7 +7,7 @@
 
 import { processMessage, processMessageWithUrls, processMessageLlm, processMessageWithUrlsLlm } from "./wal.js";
 import { extractUrls } from "./url-fetch.js";
-import { insertFact, searchFacts, addressDriftFinding, insertFactEmbedding, type Fact, type SourceType, type Confidence } from "./storage.js";
+import { insertFact, insertDocument, searchFacts, addressDriftFinding, insertFactEmbedding, type Fact, type SourceType, type Confidence } from "./storage.js";
 import { runConsolidation, normalize, contentOverlaps, type ConsolidationSummary } from "./consolidation.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
 import { retrieve, getStatus, type RetrievalResult } from "./retrieval.js";
@@ -22,6 +22,20 @@ const CONFIDENCE_MAP: Record<string, Confidence> = {
   question:   "medium",
   opinion:    "low",
 };
+
+// ── Bot command filter ───────────────────────────────────────────────────────
+// Telegram/Discord bot commands (/start, /help, /reset, /cancel, …) carry no
+// substantive content. Detect a message that is *only* a slash command — with
+// optional @botname and optional short trailing args — and let the caller skip
+// ingestion. A `/note here's my long note…` style command still falls through.
+const BOT_COMMAND_RE = /^\s*\/[a-zA-Z][a-zA-Z0-9_]*(@[a-zA-Z0-9_]+)?(\s.*)?$/;
+export function isBotCommand(message: string): boolean {
+  const trimmed = message.trim();
+  if (!BOT_COMMAND_RE.test(trimmed)) return false;
+  // Only treat as a pure command if the whole message is short. A long
+  // message starting with "/" is almost certainly not a command.
+  return trimmed.length <= 64 && !trimmed.includes("\n");
+}
 
 // ── Conflict detection ───────────────────────────────────────────────────────
 
@@ -77,6 +91,7 @@ async function storeFact(
   messageId: string | null,
   sourceUrl: string | null,
   sourceFile: string | null,
+  documentId: number | null,
 ): Promise<{ type: string; text: string; id: number; tags: string[]; confidence: string; source_url?: string }> {
   const id = await insertFact({
     content:       fact.text,
@@ -91,6 +106,7 @@ async function storeFact(
     message_id:    messageId,
     source_url:    sourceUrl,
     source_file:   sourceFile,
+    document_id:   documentId,
   });
 
   // Embed asynchronously — never blocks or fails the insert
@@ -113,10 +129,28 @@ export async function wal_append(args: {
   method: string;
   conflicts: Conflict[];
 }> {
-  const urls = extractUrls(args.message);
   const result: Array<{ type: string; text: string; id: number; tags?: string[]; confidence?: string; source_url?: string }> = [];
   const allConflicts: Conflict[] = [];
   let method = "llm";
+
+  // Skip bot slash-commands (/start, /help, /reset, …). They carry no
+  // substantive content and should not pollute documents or facts.
+  if (isBotCommand(args.message)) {
+    return { entries: result, method: "skipped-command", conflicts: allConflicts };
+  }
+
+  const urls = extractUrls(args.message);
+
+  // Persist the raw incoming message as a first-class Document so retrieval
+  // can surface verbatim content even when fact extraction misses details.
+  const primaryDocId = await insertDocument({
+    source:      args.source,
+    source_file: args.source_file ?? null,
+    source_url:  args.source_url ?? null,
+    message_id:  args.message_id ?? null,
+    content:     args.message,
+    tags:        [],
+  });
 
   if (urls.length === 0) {
     // Plain text — use LLM extraction (falls back to regex internally)
@@ -126,7 +160,7 @@ export async function wal_append(args: {
     for (const fact of extraction.facts) {
       const entry = await storeFact(
         fact, args.source, args.timestamp, args.message,
-        args.message_id ?? null, null, args.source_file ?? null,
+        args.message_id ?? null, null, args.source_file ?? null, primaryDocId,
       );
       result.push(entry);
       const conflicts = await findConflicts(entry.id, fact);
@@ -142,18 +176,28 @@ export async function wal_append(args: {
     for (const fact of textResult.facts) {
       const entry = await storeFact(
         fact, args.source, args.timestamp, args.message,
-        args.message_id ?? null, null, null,
+        args.message_id ?? null, null, null, primaryDocId,
       );
       result.push(entry);
       const conflicts = await findConflicts(entry.id, fact);
       allConflicts.push(...conflicts);
     }
 
-    for (const { url, result: urlResult } of urlResults) {
+    for (const { url, result: urlResult, description } of urlResults) {
+      // Each fetched URL becomes its own Document so retrieval can cite the
+      // original page content instead of only distilled facts.
+      const urlDocId = await insertDocument({
+        source:      `web:${url}`,
+        source_file: null,
+        source_url:  url,
+        message_id:  args.message_id ?? null,
+        content:     description ?? "",
+        tags:        [],
+      });
       for (const fact of urlResult.facts) {
         const entry = await storeFact(
           fact, `web:${url}`, args.timestamp, args.message,
-          args.message_id ?? null, url, null,
+          args.message_id ?? null, url, null, urlDocId,
         );
         result.push(entry);
         const conflicts = await findConflicts(entry.id, fact);

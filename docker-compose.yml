@@ -7,6 +7,7 @@ services:
     environment:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN}"
+      OPENCLAW_BUNDLED_SKILLS_DIR: "/opt/whatson-skills"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
       TARGET_REPO: "${TARGET_REPO:-}"
       WHATSON_CONTEXT_DIR: "${WHATSON_CONTEXT_DIR:-docs/context}"
@@ -21,11 +22,9 @@ services:
       WHATSON_EMBEDDING_DIMS: "${WHATSON_EMBEDDING_DIMS:-512}"
     volumes:
       - ./data/openclaw-config:/home/node/.openclaw
-      - ./skills:/home/node/.openclaw/workspace/skills
-      - /home/node/.openclaw/workspace/skills/context-agent/node_modules
       - ./AGENTS.md:/home/node/.openclaw/workspace/AGENTS.md:ro
       - ./SOUL.md:/home/node/.openclaw/workspace/SOUL.md:ro
-      - ./data/context-data:/home/node/.openclaw/workspace/skills/context-agent/data
+      - ./data/context-data:/opt/whatson-skills/context-agent/data
       - ./tools/gateway-healthcheck.sh:/usr/local/bin/gateway-healthcheck.sh:ro
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway-healthcheck.sh"]

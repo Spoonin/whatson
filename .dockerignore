@@ -1,0 +1,11 @@
+.git
+node_modules
+skills/context-agent/node_modules
+skills/context-agent/dist
+skills/context-agent/.built*
+data
+documents
+*.md
+!skills/context-agent/SKILL.md
+!AGENTS.md
+!SOUL.md

@@ -650,26 +650,38 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
     notes: repoSync ? JSON.stringify(repoSync) : null,
   });
 
-  // Phase 5: Drift Analysis (opt-in via WHATSON_DRIFT_ENABLED=true)
-  // Shells out to Claude Code CLI to verify codebase against recorded decisions.
-  // Non-fatal — failures are captured but do not abort consolidation.
-  let driftAnalysis: DriftAnalysisResult | { error: string } | { skipped: string } | undefined;
+  // Phase 5: Drift Analysis — detached. Shells to Claude Code CLI which can
+  // take minutes; running it inline blocks the MCP response and causes the
+  // gateway to time out. Kick it off fire-and-forget; it logs its own row.
+  const driftAnalysis: { skipped: string } = { skipped: "running in background" };
   const t5 = Date.now();
-  try {
-    driftAnalysis = await runDriftAnalysis();
-  } catch (e) {
-    driftAnalysis = { error: e instanceof Error ? e.message : String(e) };
-  }
-  await logConsolidationPhase({
-    run_at: runAt,
-    phase: "drift",
-    facts_processed: "factsAnalyzed" in (driftAnalysis ?? {}) ? (driftAnalysis as DriftAnalysisResult).factsAnalyzed : 0,
-    facts_merged: 0,
-    facts_invalidated: 0,
-    contradictions_found: "inconsistencies" in (driftAnalysis ?? {}) ? (driftAnalysis as DriftAnalysisResult).inconsistencies : 0,
-    duration_ms: Date.now() - t5,
-    notes: driftAnalysis ? JSON.stringify(driftAnalysis) : null,
-  });
+  runDriftAnalysis()
+    .then(async (result) => {
+      await logConsolidationPhase({
+        run_at: runAt,
+        phase: "drift",
+        facts_processed: "factsAnalyzed" in result ? result.factsAnalyzed : 0,
+        facts_merged: 0,
+        facts_invalidated: 0,
+        contradictions_found: "inconsistencies" in result ? result.inconsistencies : 0,
+        duration_ms: Date.now() - t5,
+        notes: JSON.stringify(result),
+      });
+    })
+    .catch(async (e) => {
+      const err = e instanceof Error ? e.message : String(e);
+      console.error("[drift-bg]", err);
+      await logConsolidationPhase({
+        run_at: runAt,
+        phase: "drift",
+        facts_processed: 0,
+        facts_merged: 0,
+        facts_invalidated: 0,
+        contradictions_found: 0,
+        duration_ms: Date.now() - t5,
+        notes: JSON.stringify({ error: err }),
+      });
+    });
 
   // Build human-readable report
   const report = await formatConsolidationReport({

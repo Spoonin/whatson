@@ -34,6 +34,7 @@ export interface Fact {
   message_id: string | null;
   source_url: string | null;
   source_file: string | null;
+  document_id?: number | null;
 }
 
 export interface FactRow {
@@ -52,6 +53,29 @@ export interface FactRow {
   message_id: string | null;
   source_url: string | null;
   source_file: string | null;
+  document_id: number | null;
+}
+
+export interface Document {
+  id?: number;
+  source: string;
+  source_file: string | null;
+  source_url: string | null;
+  message_id: string | null;
+  content: string;
+  tags: string[];
+  created_at: string;
+}
+
+export interface DocumentRow {
+  id: number;
+  source: string;
+  source_file: string | null;
+  source_url: string | null;
+  message_id: string | null;
+  content: string;
+  tags: string; // JSON string in DB
+  created_at: string;
 }
 
 export interface FactRelation {
@@ -119,6 +143,20 @@ export async function _setDbForTest(db?: DB): Promise<DB> {
 
 function migrate(db: DB): void {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS documents (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      source          TEXT    NOT NULL,
+      source_file     TEXT,
+      source_url      TEXT,
+      message_id      TEXT,
+      content         TEXT    NOT NULL,
+      tags            TEXT,
+      created_at      TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_documents_source  ON documents(source);
+    CREATE INDEX IF NOT EXISTS idx_documents_message ON documents(message_id);
+    CREATE INDEX IF NOT EXISTS idx_documents_file    ON documents(source_file);
+
     CREATE TABLE IF NOT EXISTS facts (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       content         TEXT    NOT NULL,
@@ -135,12 +173,15 @@ function migrate(db: DB): void {
       message_id      TEXT,
       source_url      TEXT,
       source_file     TEXT,
-      FOREIGN KEY (superseded_by) REFERENCES facts(id)
+      document_id     INTEGER,
+      FOREIGN KEY (superseded_by) REFERENCES facts(id),
+      FOREIGN KEY (document_id)   REFERENCES documents(id)
     );
     CREATE INDEX IF NOT EXISTS idx_facts_valid    ON facts(valid_from, valid_to);
     CREATE INDEX IF NOT EXISTS idx_facts_source   ON facts(source_type);
     CREATE INDEX IF NOT EXISTS idx_facts_tags     ON facts(tags);
     CREATE INDEX IF NOT EXISTS idx_facts_message  ON facts(message_id);
+    CREATE INDEX IF NOT EXISTS idx_facts_document ON facts(document_id);
 
     CREATE TABLE IF NOT EXISTS fact_relations (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,6 +221,7 @@ function migrate(db: DB): void {
   `);
 
   migrateFts5(db);
+  migrateDocumentsFts5(db);
   migrateVec0(db);
 }
 
@@ -218,6 +260,39 @@ function migrateFts5(db: DB): void {
   `);
 }
 
+function migrateDocumentsFts5(db: DB): void {
+  const existing = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts'")
+    .get();
+  if (existing) return;
+
+  db.exec(`
+    CREATE VIRTUAL TABLE documents_fts USING fts5(
+      content,
+      tags,
+      content='documents',
+      content_rowid='id',
+      tokenize='porter unicode61'
+    );
+
+    CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+      INSERT INTO documents_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+    END;
+
+    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+      INSERT INTO documents_fts(documents_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
+    END;
+
+    CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+      INSERT INTO documents_fts(documents_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
+      INSERT INTO documents_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+    END;
+
+    INSERT INTO documents_fts(rowid, content, tags)
+      SELECT id, content, COALESCE(tags, '') FROM documents;
+  `);
+}
+
 // vec0 virtual table for embedding vectors. Only created if sqlite-vec loaded.
 function migrateVec0(db: DB): void {
   if (!_vecLoaded) return;
@@ -243,11 +318,11 @@ export async function insertFact(fact: Omit<Fact, "id" | "created_at" | "updated
       `INSERT INTO facts
         (content, source, source_type, confidence, valid_from, valid_to,
          created_at, updated_at, superseded_by, tags, raw_message,
-         message_id, source_url, source_file)
+         message_id, source_url, source_file, document_id)
        VALUES
         (@content, @source, @source_type, @confidence, @valid_from, @valid_to,
          @created_at, @updated_at, @superseded_by, @tags, @raw_message,
-         @message_id, @source_url, @source_file)`
+         @message_id, @source_url, @source_file, @document_id)`
     )
     .run({
       content: fact.content,
@@ -264,8 +339,72 @@ export async function insertFact(fact: Omit<Fact, "id" | "created_at" | "updated
       message_id: fact.message_id ?? null,
       source_url: fact.source_url ?? null,
       source_file: fact.source_file ?? null,
+      document_id: fact.document_id ?? null,
     });
   return Number(info.lastInsertRowid);
+}
+
+// ── Documents CRUD ────────────────────────────────────────────────────────────
+
+export async function insertDocument(doc: Omit<Document, "id" | "created_at">): Promise<number> {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const info = db
+    .prepare(
+      `INSERT INTO documents (source, source_file, source_url, message_id, content, tags, created_at)
+       VALUES (@source, @source_file, @source_url, @message_id, @content, @tags, @created_at)`
+    )
+    .run({
+      source: doc.source,
+      source_file: doc.source_file ?? null,
+      source_url: doc.source_url ?? null,
+      message_id: doc.message_id ?? null,
+      content: doc.content,
+      tags: JSON.stringify(doc.tags ?? []),
+      created_at: now,
+    });
+  return Number(info.lastInsertRowid);
+}
+
+export async function getDocument(id: number): Promise<Document | null> {
+  const db = await getDb();
+  const row = db.prepare("SELECT * FROM documents WHERE id = ?").get(id) as DocumentRow | undefined;
+  return row ? deserializeDocument(row) : null;
+}
+
+export async function getDocumentsByIds(ids: number[]): Promise<Document[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT * FROM documents WHERE id IN (${placeholders})`)
+    .all(...ids) as DocumentRow[];
+  return rows.map(deserializeDocument);
+}
+
+export async function searchDocuments(keyword: string, limit = 10): Promise<Document[]> {
+  const db = await getDb();
+  const kw = keyword.trim();
+  if (!kw) return [];
+  const matchExpr = ftsMatchExpression(kw);
+  const rows = db
+    .prepare(
+      `SELECT d.*
+         FROM documents_fts
+         JOIN documents d ON d.id = documents_fts.rowid
+        WHERE documents_fts MATCH ?
+        ORDER BY bm25(documents_fts), d.created_at DESC
+        LIMIT ?`
+    )
+    .all(matchExpr, limit) as DocumentRow[];
+  return rows.map(deserializeDocument);
+}
+
+function deserializeDocument(row: DocumentRow): Document {
+  return {
+    ...row,
+    tags: row.tags ? (JSON.parse(row.tags) as string[]) : [],
+  };
 }
 
 export async function getFact(id: number): Promise<Fact | null> {

@@ -68,11 +68,11 @@ export function isDerivable(line: string): boolean {
 const EXTRACTION_PROMPT = `You are a fact extraction agent. Given a block of text from a conversation or document, extract discrete, atomic facts.
 
 For each fact, classify it as one of:
-- "decision" — a choice that was made (e.g. "We will use PostgreSQL", "Rejected option B")
+- "decision" — a choice that was made or a stated requirement/guardrail/mechanism (e.g. "We will use PostgreSQL", "Run in a Docker sandbox", "Support Market/Limit/Trailing-Stop orders")
 - "fact" — a statement of truth or observation (e.g. "The API latency is 200ms", "Team has 5 members")
 - "correction" — something that overrides a previous belief (e.g. "Actually, it's Redis not Memcached")
 - "opinion" — a subjective view (e.g. "I think we should use TypeScript")
-- "question" — an open question needing resolution (e.g. "What database should we use?")
+- "question" — a genuinely UNRESOLVED question with no stated answer in the text (e.g. "What database should we use?"). If the text explicitly answers itself (e.g. a Security section listing mitigations), those are decisions, not questions.
 
 For each fact, also:
 - Assign confidence: "high" (explicitly stated, definitive), "medium" (stated but could change), "low" (implied, uncertain)
@@ -82,7 +82,9 @@ IMPORTANT:
 - Do NOT extract code snippets, file paths, import statements, or git output — these are derivable from the codebase.
 - Do NOT extract trivial greetings, acknowledgments, or filler ("ok", "sure", "got it").
 - Each fact should be self-contained — a reader should understand it without seeing the original message.
-- Prefer fewer, higher-quality facts over many noisy ones.
+- Be exhaustive for structured documents (PRDs, specs, roadmaps): extract every distinct decision, requirement, metric, user story, roadmap phase, and guardrail. Prefer completeness over brevity when the source is dense.
+- For casual chat: prefer fewer, higher-quality facts over many noisy ones.
+- Include the project/system name as its own fact when introduced.
 
 Respond with a JSON array. Each element:
 {"type": "decision|fact|correction|opinion|question", "text": "...", "tags": ["..."], "confidence": "high|medium|low"}
@@ -109,12 +111,12 @@ export async function extractWithLlm(
   }
 
   // Cap input to avoid excessive token usage
-  const input = filtered.slice(0, 6000);
+  const input = filtered.slice(0, 12000);
 
   try {
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
+      max_tokens: 4096,
       messages: [
         {
           role: "user",
