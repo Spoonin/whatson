@@ -396,6 +396,53 @@ function sourceFilename(key: string): string {
   return `${day}_${slugify(src)}.md`;
 }
 
+// ── Single-file push (for render artifacts) ──────────────────────────────────
+
+/**
+ * Copy a single rendered file into the target repo and push.
+ * Reuses the same checkout/auth/commit flow as syncToTargetRepo.
+ */
+export async function syncRenderedFile(
+  localPath: string,
+  artifact: string
+): Promise<RepoSyncResult> {
+  const cfg = getRepoSyncConfig();
+  if (!cfg) {
+    return { skipped: "TARGET_REPO not configured", filesWritten: 0, committed: false, pushed: false };
+  }
+
+  ensureCheckout(cfg);
+
+  const contextPath = path.join(cfg.workDir, cfg.contextDir);
+  fs.mkdirSync(contextPath, { recursive: true });
+  fs.copyFileSync(localPath, path.join(contextPath, artifact));
+
+  const relPath = path.join(cfg.contextDir, artifact);
+  const authorArgs = [
+    "-c", `user.name=${cfg.commitAuthorName}`,
+    "-c", `user.email=${cfg.commitAuthorEmail}`,
+  ];
+
+  git(["add", relPath], cfg.workDir);
+
+  const status = git(["status", "--porcelain", relPath], cfg.workDir).trim();
+  if (status.length === 0) {
+    return { filesWritten: 1, committed: false, pushed: false };
+  }
+
+  const commitMessage = `context: render ${artifact}`;
+  git([...authorArgs, "commit", "-m", commitMessage], cfg.workDir);
+  const commitSha = git(["rev-parse", "HEAD"], cfg.workDir).trim();
+
+  let pushed = false;
+  if (cfg.push) {
+    git(["push"], cfg.workDir);
+    pushed = true;
+  }
+
+  return { filesWritten: 1, committed: true, pushed, commitSha, commitMessage };
+}
+
 // ── Main sync ────────────────────────────────────────────────────────────────
 
 export async function syncToTargetRepo(): Promise<RepoSyncResult> {

@@ -139,11 +139,33 @@ export async function _setDbForTest(db?: DB): Promise<DB> {
   return _db;
 }
 
-// ── Migrations ────────────────────────────────────────────────────────────────
+// ── Schema ───────────────────────────────────────────────────────────────────
+// Single-shot schema creation. Bump SCHEMA_VERSION to nuke and recreate.
+// Safe while all data is test data; swap to proper migrations for production.
+
+const SCHEMA_VERSION = 2;
 
 function migrate(db: DB): void {
+  const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  if (row.user_version === SCHEMA_VERSION) return;
+
+  // Wipe stale schema (tables + triggers + indexes)
+  if (row.user_version !== 0) {
+    const objects = db
+      .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+      .all() as { type: string; name: string }[];
+    for (const { type, name } of objects) {
+      if (type === "table" || type === "view") {
+        db.exec(`DROP TABLE IF EXISTS "${name}"`);
+      } else if (type === "trigger") {
+        db.exec(`DROP TRIGGER IF EXISTS "${name}"`);
+      }
+    }
+  }
+
+  // ── Core tables ──
   db.exec(`
-    CREATE TABLE IF NOT EXISTS documents (
+    CREATE TABLE documents (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       source          TEXT    NOT NULL,
       source_file     TEXT,
@@ -153,11 +175,11 @@ function migrate(db: DB): void {
       tags            TEXT,
       created_at      TEXT    NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_documents_source  ON documents(source);
-    CREATE INDEX IF NOT EXISTS idx_documents_message ON documents(message_id);
-    CREATE INDEX IF NOT EXISTS idx_documents_file    ON documents(source_file);
+    CREATE INDEX idx_documents_source  ON documents(source);
+    CREATE INDEX idx_documents_message ON documents(message_id);
+    CREATE INDEX idx_documents_file    ON documents(source_file);
 
-    CREATE TABLE IF NOT EXISTS facts (
+    CREATE TABLE facts (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       content         TEXT    NOT NULL,
       source          TEXT    NOT NULL,
@@ -177,13 +199,13 @@ function migrate(db: DB): void {
       FOREIGN KEY (superseded_by) REFERENCES facts(id),
       FOREIGN KEY (document_id)   REFERENCES documents(id)
     );
-    CREATE INDEX IF NOT EXISTS idx_facts_valid    ON facts(valid_from, valid_to);
-    CREATE INDEX IF NOT EXISTS idx_facts_source   ON facts(source_type);
-    CREATE INDEX IF NOT EXISTS idx_facts_tags     ON facts(tags);
-    CREATE INDEX IF NOT EXISTS idx_facts_message  ON facts(message_id);
-    CREATE INDEX IF NOT EXISTS idx_facts_document ON facts(document_id);
+    CREATE INDEX idx_facts_valid    ON facts(valid_from, valid_to);
+    CREATE INDEX idx_facts_source   ON facts(source_type);
+    CREATE INDEX idx_facts_tags     ON facts(tags);
+    CREATE INDEX idx_facts_message  ON facts(message_id);
+    CREATE INDEX idx_facts_document ON facts(document_id);
 
-    CREATE TABLE IF NOT EXISTS fact_relations (
+    CREATE TABLE fact_relations (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       fact_id         INTEGER NOT NULL,
       related_fact_id INTEGER NOT NULL,
@@ -193,7 +215,7 @@ function migrate(db: DB): void {
       FOREIGN KEY (related_fact_id) REFERENCES facts(id)
     );
 
-    CREATE TABLE IF NOT EXISTS consolidation_log (
+    CREATE TABLE consolidation_log (
       id                   INTEGER PRIMARY KEY AUTOINCREMENT,
       run_at               TEXT    NOT NULL,
       phase                TEXT    NOT NULL,
@@ -205,7 +227,7 @@ function migrate(db: DB): void {
       notes                TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS drift_findings (
+    CREATE TABLE drift_findings (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       run_at          TEXT    NOT NULL,
       fact_id         INTEGER NOT NULL,
@@ -216,96 +238,60 @@ function migrate(db: DB): void {
       addressed_at    TEXT,
       FOREIGN KEY (fact_id) REFERENCES facts(id)
     );
-    CREATE INDEX IF NOT EXISTS idx_drift_run ON drift_findings(run_at);
-    CREATE INDEX IF NOT EXISTS idx_drift_unanswered ON drift_findings(addressed, question);
+    CREATE INDEX idx_drift_run ON drift_findings(run_at);
+    CREATE INDEX idx_drift_unanswered ON drift_findings(addressed, question);
   `);
 
-  migrateFts5(db);
-  migrateDocumentsFts5(db);
-  migrateVec0(db);
-}
-
-// External-content FTS5: no row duplication; triggers keep it in sync.
-// Backfills from `facts` on first creation so existing DBs gain search.
-function migrateFts5(db: DB): void {
-  const existing = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='facts_fts'")
-    .get();
-  if (existing) return;
-
+  // ── FTS5: facts ──
   db.exec(`
     CREATE VIRTUAL TABLE facts_fts USING fts5(
-      content,
-      tags,
-      content='facts',
-      content_rowid='id',
+      content, tags,
+      content='facts', content_rowid='id',
       tokenize='porter unicode61'
     );
 
     CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN
       INSERT INTO facts_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
     END;
-
     CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN
       INSERT INTO facts_fts(facts_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
     END;
-
     CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN
       INSERT INTO facts_fts(facts_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
       INSERT INTO facts_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
     END;
-
-    INSERT INTO facts_fts(rowid, content, tags)
-      SELECT id, content, COALESCE(tags, '') FROM facts;
   `);
-}
 
-function migrateDocumentsFts5(db: DB): void {
-  const existing = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='documents_fts'")
-    .get();
-  if (existing) return;
-
+  // ── FTS5: documents ──
   db.exec(`
     CREATE VIRTUAL TABLE documents_fts USING fts5(
-      content,
-      tags,
-      content='documents',
-      content_rowid='id',
+      content, tags,
+      content='documents', content_rowid='id',
       tokenize='porter unicode61'
     );
 
     CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
       INSERT INTO documents_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
     END;
-
     CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
       INSERT INTO documents_fts(documents_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
     END;
-
     CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
       INSERT INTO documents_fts(documents_fts, rowid, content, tags) VALUES ('delete', old.id, old.content, old.tags);
       INSERT INTO documents_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
     END;
-
-    INSERT INTO documents_fts(rowid, content, tags)
-      SELECT id, content, COALESCE(tags, '') FROM documents;
   `);
-}
 
-// vec0 virtual table for embedding vectors. Only created if sqlite-vec loaded.
-function migrateVec0(db: DB): void {
-  if (!_vecLoaded) return;
-  const existing = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fact_embeddings'")
-    .get();
-  if (existing) return;
+  // ── vec0: embeddings (only if sqlite-vec loaded) ──
+  if (_vecLoaded) {
+    db.exec(`
+      CREATE VIRTUAL TABLE fact_embeddings USING vec0(
+        embedding float[512]
+      );
+    `);
+  }
 
-  db.exec(`
-    CREATE VIRTUAL TABLE fact_embeddings USING vec0(
-      embedding float[512]
-    );
-  `);
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
 
 // ── Facts CRUD ────────────────────────────────────────────────────────────────

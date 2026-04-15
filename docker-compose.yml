@@ -17,14 +17,24 @@ services:
       WHATSON_SYNC_EVERY_N_CONSOLIDATION: "${WHATSON_SYNC_EVERY_N_CONSOLIDATION:-1}"
       WHATSON_DRIFT_ENABLED: "${WHATSON_DRIFT_ENABLED:-false}"
       WHATSON_DRIFT_MODEL: "${WHATSON_DRIFT_MODEL:-claude-opus-4-6}"
+      # LLM backend switch: "sdk" (api.anthropic.com, billed API credits)
+      # or "cli" (`claude -p`, billed against a logged-in Pro/Max session).
+      # Per-component overrides take precedence over the global default.
+      # Drift defaults to "cli" regardless because it needs tool access.
+      LLM_BACKEND: "${LLM_BACKEND:-sdk}"
+      LLM_BACKEND_EXTRACT: "${LLM_BACKEND_EXTRACT:-}"
+      LLM_BACKEND_CONSOLIDATION: "${LLM_BACKEND_CONSOLIDATION:-}"
+      LLM_BACKEND_DRIFT: "${LLM_BACKEND_DRIFT:-}"
+      LLM_BACKEND_RENDER: "${LLM_BACKEND_RENDER:-}"
+      LLM_BACKEND_RETRIEVAL: "${LLM_BACKEND_RETRIEVAL:-}"
       VOYAGE_API_KEY: "${VOYAGE_API_KEY:-}"
       WHATSON_EMBEDDING_MODEL: "${WHATSON_EMBEDDING_MODEL:-voyage-3-lite}"
       WHATSON_EMBEDDING_DIMS: "${WHATSON_EMBEDDING_DIMS:-512}"
     volumes:
       - ./data/openclaw-config:/home/node/.openclaw
-      - ./AGENTS.md:/home/node/.openclaw/workspace/AGENTS.md:ro
-      - ./SOUL.md:/home/node/.openclaw/workspace/SOUL.md:ro
+      - ./SOUL.md:/opt/whatson-prompts/SOUL.md:ro
       - ./data/context-data:/opt/whatson-skills/context-agent/data
+      - ./data/claude-session:/home/node/.claude
       - ./tools/gateway-healthcheck.sh:/usr/local/bin/gateway-healthcheck.sh:ro
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway-healthcheck.sh"]

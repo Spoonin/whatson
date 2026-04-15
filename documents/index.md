@@ -12,7 +12,7 @@ Build a continuously operating agent that:
 * Collects context from heterogeneous sources (code, Teams, documents, human interviews).
 * Structures and organizes the gathered knowledge.
 * Maintains coherence at scale (resolves contradictions, invalidates outdated info).
-* Provides the LLM with relevant context for specific tasks.
+* Provides the LLM with relevant context for specific tasks for project development.
 * Operates autonomously with periodic human-in-the-loop interaction.
 
 ---

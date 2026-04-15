@@ -24,6 +24,7 @@ import {
   type DriftFinding,
 } from "./storage.js";
 import { getRepoSyncConfig } from "./repo-sync.js";
+import { resolveBackend } from "./llm.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WORKDIR = path.resolve(__dirname, "../data/target-repo");
@@ -187,6 +188,19 @@ export async function runDriftAnalysis(): Promise<DriftAnalysisResult> {
   if (process.env.WHATSON_DRIFT_ENABLED !== "true") {
     return {
       skipped: "WHATSON_DRIFT_ENABLED is not 'true'",
+      factsAnalyzed: 0,
+      findings: 0,
+      inconsistencies: 0,
+      questionsGenerated: 0,
+    };
+  }
+
+  // Gate: drift needs tool access (Read/Grep/Glob/Bash) to scan the target
+  // repo, which the SDK backend cannot provide. Refuse if the resolver
+  // returns "sdk" for this component.
+  if (resolveBackend("drift") !== "cli") {
+    return {
+      skipped: "drift requires LLM_BACKEND_DRIFT=cli (needs tool access)",
       factsAnalyzed: 0,
       findings: 0,
       inconsistencies: 0,

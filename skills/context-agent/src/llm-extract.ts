@@ -1,15 +1,15 @@
 /**
- * LLM-based fact extraction using Anthropic API.
+ * LLM-based fact extraction.
  *
- * Replaces pure regex classification with:
- *   1. Regex pre-filter (fast, catches obvious candidates)
- *   2. LLM classification (accurate, handles nuance)
- *
- * Falls back to regex-only when API key is missing or call fails.
+ * Regex pre-filter strips derivable noise (code, paths, git output) to save
+ * tokens, then the shared `llm.ts` dispatcher routes the classification call
+ * through whichever backend (SDK or CLI) is configured for the `extract`
+ * component. Returns an empty result when the backend is unavailable or the
+ * call fails — callers fall back to regex-only classification.
  */
 
-import Anthropic from "@anthropic-ai/sdk";
 import type { SourceType } from "./storage.js";
+import { callModel, isBackendReady } from "./llm.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -23,23 +23,6 @@ export interface ExtractedFact {
 export interface ExtractionResult {
   facts: ExtractedFact[];
   method: "llm" | "regex";
-}
-
-// ── Anthropic client (lazy singleton) ───────────────────────────────────────
-
-let _client: Anthropic | null = null;
-
-function getClient(): Anthropic | null {
-  if (_client) return _client;
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
-  _client = new Anthropic({ apiKey });
-  return _client;
-}
-
-/** Override client for testing */
-export function _setClientForTest(client: Anthropic | null): void {
-  _client = client;
 }
 
 // ── Non-derivable filter ────────────────────────────────────────────────────
@@ -97,8 +80,7 @@ export async function extractWithLlm(
   text: string,
   source: string
 ): Promise<ExtractionResult> {
-  const client = getClient();
-  if (!client) {
+  if (!isBackendReady("extract").ready) {
     return { facts: [], method: "regex" };
   }
 
@@ -114,27 +96,17 @@ export async function extractWithLlm(
   const input = filtered.slice(0, 12000);
 
   try {
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: `Source: ${source}\n\nText to analyze:\n\n${input}`,
-        },
-      ],
+    const { text: responseText } = await callModel({
+      component: "extract",
       system: EXTRACTION_PROMPT,
+      user: `Source: ${source}\n\nText to analyze:\n\n${input}`,
+      model: "claude-haiku-4-5-20251001",
+      maxTokens: 4096,
     });
-
-    const content = response.content[0];
-    if (content.type !== "text") {
-      return { facts: [], method: "llm" };
-    }
-
-    const parsed = parseResponse(content.text);
+    const parsed = parseResponse(responseText);
     return { facts: parsed, method: "llm" };
   } catch (err) {
-    console.error("[llm-extract] Anthropic API error, falling back to regex:", err);
+    console.error("[llm-extract] LLM call failed, falling back to regex:", err);
     return { facts: [], method: "regex" };
   }
 }

@@ -10,6 +10,7 @@ import { extractUrls } from "./url-fetch.js";
 import { insertFact, insertDocument, searchFacts, addressDriftFinding, insertFactEmbedding, type Fact, type SourceType, type Confidence } from "./storage.js";
 import { runConsolidation, normalize, contentOverlaps, type ConsolidationSummary } from "./consolidation.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
+import { renderProjectDoc, type RenderResult, type RenderOptions } from "./render.js";
 import { retrieve, getStatus, type RetrievalResult } from "./retrieval.js";
 import { embedText } from "./embeddings.js";
 import type { ExtractedFact } from "./llm-extract.js";
@@ -270,6 +271,12 @@ export async function consolidate(): Promise<ConsolidationSummary> {
 
 export async function sync_repo(): Promise<RepoSyncResult> {
   return syncToTargetRepo();
+}
+
+// ── Tool: render_project ─────────────────────────────────────────────────────
+
+export async function render_project(args: RenderOptions = {}): Promise<RenderResult> {
+  return renderProjectDoc(args);
 }
 
 // ── Tool: get_status ──────────────────────────────────────────────────────────

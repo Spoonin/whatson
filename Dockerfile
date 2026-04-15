@@ -10,6 +10,7 @@ COPY --chown=node:node skills/context-agent/package.json skills/context-agent/pn
 RUN pnpm install --frozen-lockfile --store-dir /tmp/pnpm-store && rm -rf /tmp/pnpm-store
 COPY --chown=node:node skills/context-agent/tsconfig.json skills/context-agent/SKILL.md ./
 COPY --chown=node:node skills/context-agent/src ./src
+COPY --chown=node:node skills/context-agent/templates ./templates
 RUN pnpm run build
 
 USER root

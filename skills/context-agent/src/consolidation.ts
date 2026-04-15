@@ -9,6 +9,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import Anthropic from "@anthropic-ai/sdk";
+import { callModel, isBackendReady, _setSdkClientForTest } from "./llm.js";
 import {
   getActiveFacts,
   expireFact,
@@ -118,21 +119,14 @@ interface ConsolidateResult {
   contradictions: number;
 }
 
-// ── Anthropic client (lazy singleton, same pattern as llm-extract.ts) ────────
+// ── Test hook ───────────────────────────────────────────────────────────────
+// Consolidation now routes through the shared `llm.ts` dispatcher. The test
+// mock (`{ messages: { create(...) } }`) is shaped like the Anthropic SDK
+// client, so we forward it to the SDK slot in the dispatcher.
 
-let _client: Anthropic | null = null;
-
-function getClient(): Anthropic | null {
-  if (_client) return _client;
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
-  _client = new Anthropic({ apiKey });
-  return _client;
-}
-
-/** Override client for testing */
+/** Override the SDK client for tests (thin forwarder to llm.ts). */
 export function _setClientForTest(client: Anthropic | null): void {
-  _client = client;
+  _setSdkClientForTest(client);
 }
 
 // ── LLM consolidation types ─────────────────────────────────────────────────
@@ -247,26 +241,22 @@ If no actions are needed, respond with: []`;
 // ── LLM call for one cluster ────────────────────────────────────────────────
 
 async function consolidateClusterLlm(cluster: Fact[]): Promise<ConsolidationAction[]> {
-  const client = getClient();
-  if (!client) return [];
+  if (!isBackendReady("consolidation").ready) return [];
 
   const factsBlock = cluster
     .map((f) => `- ID:${f.id} [${f.source_type}] (confidence:${f.confidence}, date:${f.valid_from.slice(0, 10)}) "${f.content}"`)
     .join("\n");
 
   try {
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
+    const { text } = await callModel({
+      component: "consolidation",
       system: CONSOLIDATION_PROMPT,
-      messages: [{ role: "user", content: `Analyze this cluster:\n\n${factsBlock}` }],
+      user: `Analyze this cluster:\n\n${factsBlock}`,
+      model: "claude-haiku-4-5-20251001",
+      maxTokens: 1024,
     });
-
-    const content = response.content[0];
-    if (content.type !== "text") return [];
-
     const validIds = new Set(cluster.map((f) => f.id!));
-    return parseConsolidationResponse(content.text, validIds);
+    return parseConsolidationResponse(text, validIds);
   } catch (err) {
     console.error("[consolidation] LLM call failed, skipping cluster:", err);
     return [];
@@ -387,8 +377,7 @@ async function consolidate(newFacts: Fact[], allFacts: Fact[]): Promise<Consolid
   let totalContradictions = 0;
 
   // Try LLM path
-  const client = getClient();
-  if (client && newFacts.length > 0) {
+  if (isBackendReady("consolidation").ready && newFacts.length > 0) {
     const clusters = await clusterFacts(newFacts, allFacts, processed);
 
     for (const cluster of clusters) {
