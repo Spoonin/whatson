@@ -5,9 +5,15 @@
 
 ## Components
 
-The architecture comprises five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation, Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 --> The system uses an actor-based architecture with the Cue runtime. <!-- fact:f:18 --> A multi-stage retrieval pipeline is implemented as a core architectural concern. <!-- fact:f:19 --> Raw storage is preferred over real-time summarization. <!-- fact:f:16 -->
+The system is structured into five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation, Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 -->
 
-The `storage.ts` module implements a temporal knowledge graph backed by SQLite with the sqlite-vec extension. <!-- fact:f:28 --> The `wal.ts` module implements a write-ahead log that extracts structured data via both regex and LLM-based extraction. <!-- fact:f:29 --> The `consolidation.ts` module runs a multi-phase consolidation process; the phase count is disputed — see Unresolved. <!-- fact:f:30 --><!-- fact:f:15 -->
+The `storage.ts` module uses SQLite with a temporal knowledge graph and sqlite-vec for vector operations. <!-- fact:f:28 --> Raw storage is preferred over real-time summarization. <!-- fact:f:16 -->
+
+The `wal.ts` module implements a write-ahead log with both regex and LLM-based extraction. <!-- fact:f:29 -->
+
+The `consolidation.ts` module implements a multi-phase consolidation sequence: Orient→Gather→Consolidate→Prune&Index→Drift. <!-- fact:f:30 -->
+
+The system uses an actor-based architecture with the Cue runtime. <!-- fact:f:18 --> A multi-stage retrieval pipeline is implemented for knowledge access. <!-- fact:f:19 -->
 
 ## Technology Stack
 
@@ -19,4 +25,4 @@ _No facts available._
 
 ## Unresolved
 
-- **f:30 vs f:15 — Consolidation phase count**: `consolidation.ts` is described as a 5-phase process (Orient→Gather→Consolidate→Prune&Index→Drift) <!-- fact:f:30 -->, while the layer overview explicitly labels consolidation as 4-phase <!-- fact:f:15 -->. Both facts share the same source (`telegram:@DisterX`) and date (2026-04-16); neither can be preferred over the other.
+- **Phase count contradiction — consolidation layer**: f:15 describes the Consolidation layer as "4-phase", while f:30 states `consolidation.ts` implements a "5-phase" process (Orient→Gather→Consolidate→Prune&Index→Drift). These cannot be reconciled from the available facts. <!-- fact:f:15 --> <!-- fact:f:30 -->
