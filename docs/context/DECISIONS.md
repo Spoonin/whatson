@@ -18,7 +18,7 @@
 - Tech stack: Node.js/TypeScript, ChromaDB or LanceDB, SQLite temporal KG, Claude API (Sonnet for routine tasks, Opus for consolidation), MCP for integrations (Slack/Google Drive/GitHub), file-based WAL. <!-- fact:f:20 -->
 - Work priority order: consolidation loop first (highest risk), then storage, WAL, collectors, identity, retrieval pipeline. <!-- fact:f:21 -->
 - Human Q&A is triggered when drift analysis finds inconsistencies. <!-- fact:f:46 -->
-- The system is tested and optimized in dogfooding mode (using Whatson to develop Whatson). <!-- fact:f:47 -->
+- The system is tested and optimized in dogfooding mode, using Whatson to develop Whatson. <!-- fact:f:47 -->
 
 ## Corrections
 
