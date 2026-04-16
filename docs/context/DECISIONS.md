@@ -13,7 +13,7 @@
 - Consolidated context is used to help AI tools implement projects. <!-- fact:f:7 -->
 - Raw storage is preferred over real-time summarization. <!-- fact:f:16 -->
 - Attribution and confidence scoring are required on every fact. <!-- fact:f:17 -->
-- Actor-based architecture with Cue runtime is adopted. <!-- fact:f:18 -->
+- Actor-based architecture with Cue runtime is used. <!-- fact:f:18 -->
 - A multi-stage retrieval pipeline will be implemented. <!-- fact:f:19 -->
 - Tech stack: Node.js/TypeScript, ChromaDB or LanceDB, SQLite temporal KG, Claude API (Sonnet for routine tasks, Opus for consolidation), MCP for integrations (Slack/Google Drive/GitHub), file-based WAL. <!-- fact:f:20 -->
 - Work priority order: consolidation loop first (highest risk), then storage, WAL, collectors, identity, retrieval pipeline. <!-- fact:f:21 -->
