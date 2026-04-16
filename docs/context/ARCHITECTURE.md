@@ -5,9 +5,9 @@
 
 ## Components
 
-The architecture comprises five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation (4-phase), Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 --> The system uses an actor-based architecture with a Cue runtime. <!-- fact:f:18 --> A multi-stage retrieval pipeline is implemented as a core architectural decision. <!-- fact:f:19 --> Raw storage is preferred over real-time summarization. <!-- fact:f:16 -->
+The system is structured across five architectural layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation, Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 --> The runtime adopts an actor-based architecture driven by the Cue runtime. <!-- fact:f:18 --> Retrieval is handled by a multi-stage pipeline. <!-- fact:f:19 -->
 
-The `storage.ts` module uses SQLite with a temporal knowledge graph and the sqlite-vec extension. <!-- fact:f:28 --> The `wal.ts` module implements a write-ahead log using regex and LLM extraction. <!-- fact:f:29 --> The `consolidation.ts` module implements a 5-phase process: Orient → Gather → Consolidate → Prune & Index → Drift. <!-- fact:f:30 -->
+The `wal.ts` module implements a write-ahead log using a combination of regex and LLM extraction. <!-- fact:f:29 --> The `storage.ts` module is backed by SQLite with a temporal knowledge graph and the `sqlite-vec` extension. <!-- fact:f:28 --> Raw storage is preferred over real-time summarization. <!-- fact:f:16 --> The `consolidation.ts` module implements a sequential phase process: Orient → Gather → Consolidate → Prune & Index → Drift. <!-- fact:f:30 -->
 
 ## Technology Stack
 
@@ -19,4 +19,4 @@ _No facts available._
 
 ## Unresolved
 
-- **Consolidation phase count — f:15 vs f:30**: f:15 describes the Consolidation layer as "4-phase" <!-- fact:f:15 -->, while f:30 states `consolidation.ts` implements a 5-phase process (Orient → Gather → Consolidate → Prune & Index → Drift). <!-- fact:f:30 --> These counts cannot be reconciled from the available facts.
+- **Phase count in consolidation pipeline** — f:15 describes consolidation as a 4-phase process; f:30 describes `consolidation.ts` as implementing a 5-phase process (Orient → Gather → Consolidate → Prune & Index → Drift). These counts are irreconcilable; authoritative phase count must be confirmed. <!-- fact:f:15 --> <!-- fact:f:30 -->
