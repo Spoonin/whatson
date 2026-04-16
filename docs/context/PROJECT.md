@@ -13,7 +13,7 @@ _No facts available._
 
 ## Architecture at a Glance
 
-The system uses an actor-based architecture with the Cue runtime. <!-- fact:f:18 --> It comprises five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation (4-phase), Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 --> Storage is handled by `storage.ts` using SQLite with a temporal knowledge graph and sqlite-vec, with raw storage preferred over real-time summarization. <!-- fact:f:28 --><!-- fact:f:16 --> The `wal.ts` module implements a write-ahead log with regex and LLM extraction; `consolidation.ts` implements a 5-phase Orient→Gather→Consolidate→Prune&Index→Drift process; and the system targets a multi-stage retrieval pipeline. <!-- fact:f:29 --><!-- fact:f:30 --><!-- fact:f:19 -->
+The system uses an actor-based architecture with Cue runtime and implements a multi-stage retrieval pipeline. <!-- fact:f:18 --><!-- fact:f:19 --> Architecture comprises five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation (4-phase), Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 --> Storage is implemented via `storage.ts` using SQLite with a temporal knowledge graph and sqlite-vec, with raw storage preferred over real-time summarization. <!-- fact:f:28 --><!-- fact:f:16 --> The WAL module (`wal.ts`) combines regex and LLM extraction, while `consolidation.ts` runs a 5-phase Orient→Gather→Consolidate→Prune&Index→Drift loop. <!-- fact:f:29 --><!-- fact:f:30 -->
 
 ## Success Metrics
 
