@@ -13,7 +13,7 @@ _No facts available._
 
 ## Architecture at a Glance
 
-The system is structured as five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation, Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 --> An actor-based architecture with Cue runtime is used as the execution model. <!-- fact:f:18 --> Storage is backed by SQLite with a temporal knowledge graph and the sqlite-vec extension, with raw storage preferred over real-time summarization. <!-- fact:f:28 --><!-- fact:f:16 --> A multi-stage retrieval pipeline is implemented alongside a write-ahead log module that performs regex and LLM-based extraction. <!-- fact:f:19 --><!-- fact:f:29 -->
+The system uses an actor-based architecture with Cue runtime and comprises five layers: Identity/Soul, Storage (MemPalace wings/rooms/knowledge graph), WAL/Session state, Consolidation, Execution (plan mode), and Active collection via MCP. <!-- fact:f:18 --> <!-- fact:f:15 --> Storage is backed by SQLite with a temporal knowledge graph and sqlite-vec, with raw storage preferred over real-time summarization. <!-- fact:f:28 --> <!-- fact:f:16 --> The WAL module implements write-ahead logging with regex and LLM extraction, consolidation.ts runs a multi-phase Orient→Gather→Consolidate→Prune&Index→Drift loop, and the system includes a multi-stage retrieval pipeline. <!-- fact:f:29 --> <!-- fact:f:30 --> <!-- fact:f:19 -->
 
 ## Success Metrics
 
@@ -25,4 +25,4 @@ _No facts available._
 
 ## Unresolved
 
-- **Consolidation phase count contradiction** — f:15 describes the Consolidation layer as "4-phase", while f:30 describes `consolidation.ts` as implementing a "5-phase process: Orient→Gather→Consolidate→Prune&Index→Drift". These two counts cannot be reconciled from the available facts. <!-- fact:f:15 --><!-- fact:f:30 -->
+- **Consolidation phase count conflict:** f:30 describes consolidation.ts as a **5-phase** process (Orient→Gather→Consolidate→Prune&Index→Drift), while f:15 refers to Consolidation as **4-phase**. These claims cannot be reconciled from the available facts. <!-- fact:f:30 --> <!-- fact:f:15 -->
