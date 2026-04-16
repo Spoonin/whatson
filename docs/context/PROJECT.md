@@ -13,7 +13,7 @@ _No facts available._
 
 ## Architecture at a Glance
 
-The system is structured in five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation, Execution (plan mode), and Active collection via MCP. <!-- fact:f:15 --> An actor-based architecture with Cue runtime is used as the execution model. <!-- fact:f:18 --> `storage.ts` uses SQLite with a temporal knowledge graph and sqlite-vec; `wal.ts` implements a write-ahead log with regex and LLM extraction. <!-- fact:f:28 --> <!-- fact:f:29 --> Raw storage is preferred over real-time summarization, and a multi-stage retrieval pipeline is implemented. <!-- fact:f:16 --> <!-- fact:f:19 -->
+The system uses an actor-based architecture with the Cue runtime. <!-- fact:f:18 --> It comprises five layers: Identity/Soul, Storage (MemPalace wings/rooms/KG), WAL/Session state, Consolidation (4-phase), Execution (plan mode), and Active collection (MCP). <!-- fact:f:15 --> Storage is handled by `storage.ts` using SQLite with a temporal knowledge graph and sqlite-vec, with raw storage preferred over real-time summarization. <!-- fact:f:28 --><!-- fact:f:16 --> The `wal.ts` module implements a write-ahead log with regex and LLM extraction; `consolidation.ts` implements a 5-phase Orient→Gather→Consolidate→Prune&Index→Drift process; and the system targets a multi-stage retrieval pipeline. <!-- fact:f:29 --><!-- fact:f:30 --><!-- fact:f:19 -->
 
 ## Success Metrics
 
@@ -25,4 +25,4 @@ _No facts available._
 
 ## Unresolved
 
-- **Phase count of the consolidation process** — `f:30` states `consolidation.ts` implements a **5-phase** process (Orient→Gather→Consolidate→Prune&Index→Drift), while `f:15` describes Consolidation as a **4-phase** component. <!-- fact:f:30 --> <!-- fact:f:15 -->
+_No facts available._
