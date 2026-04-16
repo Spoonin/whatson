@@ -1,16 +1,34 @@
 /**
  * Module: Drift Analysis — Phase 5 of the consolidation pipeline
  *
- * Shells out to Claude Code CLI (`claude -p`) to verify that the target
- * codebase is consistent with recorded decisions and high-confidence facts.
- * Findings are stored in the `drift_findings` table and surfaced via MCP.
+ * Two backends:
  *
- * Configured via env vars:
- *   WHATSON_DRIFT_ENABLED   — "true" to enable (default: disabled)
- *   WHATSON_DRIFT_MODEL     — model to use (default: "claude-opus-4-6")
+ *   1. `repomix` (default): pack the target repo once via `repomix --stdout
+ *      --compress`, then run a per-fact SDK call with the packed repo in the
+ *      system prompt (cache_control: ephemeral). Fast, cheap with prompt
+ *      caching, unified billing on API credits. Bounded by context window —
+ *      falls back to `cli` when the packed output exceeds
+ *      `WHATSON_DRIFT_MAX_PACK_BYTES`.
+ *
+ *   2. `cli`: spawn a `claude -p` agent turn per fact with Read/Grep/Glob
+ *      tools. No context ceiling, but more wall time and ties us to the
+ *      subscription billing path.
+ *
+ * Findings are persisted to `drift_findings` immediately so a failed or
+ * interrupted run still surfaces partial progress. A small concurrency pool
+ * (default 4, override via `WHATSON_DRIFT_CONCURRENCY`) bounds wall time.
+ *
+ * Env vars:
+ *   WHATSON_DRIFT_ENABLED         — "true" to enable (default: disabled)
+ *   WHATSON_DRIFT_MODEL           — SDK model (default: claude-sonnet-4-6)
+ *   WHATSON_DRIFT_CONCURRENCY     — parallel calls (default: 4, cap 16)
+ *   WHATSON_DRIFT_PACK_MODE       — "repomix" | "cli" (default: repomix)
+ *   WHATSON_DRIFT_MAX_PACK_BYTES  — fallback ceiling (default: 3_000_000)
  */
 
-import { execFileSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
+import { promisify } from "util";
+import { createHash } from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -20,14 +38,23 @@ import {
   getDriftFindings,
   getUnansweredQuestions,
   getFactsByIds,
+  getCachedDriftFinding,
+  upsertDriftCache,
   type Fact,
   type DriftFinding,
 } from "./storage.js";
 import { getRepoSyncConfig } from "./repo-sync.js";
-import { resolveBackend } from "./llm.js";
+import { packRepo, invokePackedSdk } from "./drift-pack.js";
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WORKDIR = path.resolve(__dirname, "../data/target-repo");
+const LATEST_PACK_PATH = path.resolve(__dirname, "../data/LATEST-DRIFT-PACK.xml");
+
+const DEFAULT_CONCURRENCY = 4;
+const PER_CALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 min safety cap per fact
+const MAX_BUFFER = 10 * 1024 * 1024;
 
 export interface DriftAnalysisResult {
   skipped?: string;
@@ -35,114 +62,107 @@ export interface DriftAnalysisResult {
   findings: number;
   inconsistencies: number;
   questionsGenerated: number;
+  errors?: number;
+  cacheHits?: number;
 }
 
-// ── Prompt ──────────────────────────────────────────────────────────────────
+export function hashFact(fact: Fact): string {
+  return createHash("sha256")
+    .update(`${fact.source_type}\0${fact.content}`)
+    .digest("hex");
+}
 
-export function buildAnalysisPrompt(facts: Fact[]): string {
-  const factList = facts
-    .map(
-      (f) =>
-        `- [ID=${f.id}] (${f.source_type}, ${f.confidence}) ${f.content} — source: ${f.source}, date: ${f.valid_from.slice(0, 10)}`
-    )
-    .join("\n");
+function getRepoSha(workDir: string): string | null {
+  try {
+    const sha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: workDir,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
 
-  return `You are a codebase consistency auditor. You have been given a list of project decisions and facts recorded by a context agent. Your job is to verify each one against the actual codebase in the current working directory.
+// ── Per-fact prompt ─────────────────────────────────────────────────────────
 
-For each fact/decision below:
-1. Search the codebase for related files (grep for keywords, domain terms, config keys).
-2. Read the relevant files.
-3. Determine if the codebase is CONSISTENT or INCONSISTENT with the stated fact.
+export function buildPerFactPrompt(fact: Fact): string {
+  return `You are a codebase consistency auditor. Verify this single recorded fact against the current codebase in the working directory.
+
+## Fact to verify
+
+- ID: ${fact.id}
+- Type: ${fact.source_type} (confidence: ${fact.confidence})
+- Content: ${fact.content}
+- Recorded: ${fact.valid_from.slice(0, 10)} from ${fact.source}
+
+## Your job
+
+1. Search the codebase for keywords, domain terms, or config keys related to this fact.
+2. Read the most relevant files.
+3. Decide: is the codebase CONSISTENT or INCONSISTENT with the stated fact?
 4. If inconsistent, write a specific question for the stakeholders.
 
-## Facts to verify
+## Output
 
-${factList}
+Respond with ONLY a JSON object (no markdown fences, no commentary):
 
-## Output format
-
-You MUST respond with ONLY a JSON object (no markdown fences, no commentary):
-
-{
-  "findings": [
-    {
-      "fact_id": <number>,
-      "consistent": <boolean>,
-      "evidence": "<file:line — what you found>",
-      "question": "<question for stakeholders, or null if consistent>"
-    }
-  ]
-}
+{"fact_id": ${fact.id}, "consistent": <boolean>, "evidence": "<file:line — what you found, or null>", "question": "<question for stakeholders, or null if consistent>"}
 
 Rules:
-- Include ALL facts in your findings array, even consistent ones.
-- Be specific in evidence — cite file paths and line numbers.
-- Do not flag style differences — only semantic drift (wrong tech, missing feature, contradicted architecture).
-- If you cannot find any evidence for or against a fact, mark it inconsistent and ask about it.
+- Do NOT flag style differences — only semantic drift (wrong tech, missing feature, contradicted architecture).
+- If you find no evidence either way, mark inconsistent and ask about it.
+- Be specific in evidence: cite file paths.
 `;
 }
 
-// ── JSON output schema for --json-schema flag ───────────────────────────────
-
-export const OUTPUT_SCHEMA = JSON.stringify({
-  type: "object",
-  required: ["findings"],
-  properties: {
-    findings: {
-      type: "array",
-      items: {
-        type: "object",
-        required: ["fact_id", "consistent", "evidence", "question"],
-        properties: {
-          fact_id: { type: "number" },
-          consistent: { type: "boolean" },
-          evidence: { type: ["string", "null"] },
-          question: { type: ["string", "null"] },
-        },
-      },
-    },
-  },
-});
-
 // ── Parse ───────────────────────────────────────────────────────────────────
 
-interface ClaudeFinding {
+export interface ClaudeFinding {
   fact_id: number;
   consistent: boolean;
   evidence: string | null;
   question: string | null;
 }
 
-interface ClaudeOutput {
-  result?: string; // --output-format json wraps the text in { result: "..." }
-  findings?: ClaudeFinding[];
+interface ClaudeWrapper {
+  result?: string;
 }
 
-export function parseClaudeOutput(raw: string): ClaudeFinding[] {
-  // --output-format json returns { result: "<text>" } where <text> is the model's response.
-  // The model's response is the JSON we asked for.
+export function parsePerFactOutput(raw: string, expectedFactId: number): ClaudeFinding {
   let text = raw.trim();
 
-  // Try parsing as the wrapper { result: "..." } first
+  // Unwrap --output-format json envelope
   try {
-    const wrapper: ClaudeOutput = JSON.parse(text);
-    if (wrapper.result) {
-      text = wrapper.result;
-    } else if (wrapper.findings) {
-      return wrapper.findings;
+    const wrapper: ClaudeWrapper = JSON.parse(text);
+    if (typeof wrapper.result === "string") {
+      text = wrapper.result.trim();
     }
   } catch {
     // Not a wrapper — raw model output
   }
 
   // Strip markdown fences if the model added them despite instructions
-  text = text.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "");
+  text = text.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
 
   const parsed = JSON.parse(text);
-  if (!Array.isArray(parsed.findings)) {
-    throw new Error("Claude output missing 'findings' array");
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("drift output is not an object");
   }
-  return parsed.findings;
+  if (typeof parsed.consistent !== "boolean") {
+    throw new Error("drift output missing 'consistent' boolean");
+  }
+
+  // Always trust our captured id over whatever the model echoes back — a
+  // hallucinated `fact_id` here would become an FK violation on insert into
+  // drift_findings(fact_id).
+  return {
+    fact_id: expectedFactId,
+    consistent: parsed.consistent,
+    evidence: typeof parsed.evidence === "string" ? parsed.evidence : null,
+    question: typeof parsed.question === "string" ? parsed.question : null,
+  };
 }
 
 // ── Claude CLI invocation ───────────────────────────────────────────────────
@@ -156,7 +176,7 @@ function claudeExists(): boolean {
   }
 }
 
-export function invokeClaudeCode(prompt: string, workDir: string): string {
+export async function invokeClaudeCode(prompt: string, workDir: string): Promise<string> {
   const model = process.env.WHATSON_DRIFT_MODEL ?? "claude-opus-4-6";
   const args = [
     "-p", prompt,
@@ -164,117 +184,257 @@ export function invokeClaudeCode(prompt: string, workDir: string): string {
     "--output-format", "json",
     "--bare",
     "--no-session-persistence",
-    "--max-turns", "30",
+    "--max-turns", "15",
     "--allowedTools", "Read,Grep,Glob,Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(find:*)",
   ];
 
-  return execFileSync("claude", args, {
+  // Strip ANTHROPIC_API_KEY so claude -p uses the logged-in subscription
+  // session (same pattern as llm.ts callCli).
+  const { ANTHROPIC_API_KEY: _stripped, ...childEnv } = process.env;
+
+  const { stdout } = await execFileAsync("claude", args, {
     cwd: workDir,
     encoding: "utf-8",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: 5 * 60 * 1000, // 5 minute safety cap
-    env: {
-      ...process.env,
-      // Ensure Claude Code uses the same API key
-      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
-    },
+    timeout: PER_CALL_TIMEOUT_MS,
+    maxBuffer: MAX_BUFFER,
+    env: childEnv,
   });
+  return stdout;
+}
+
+// ── Concurrency pool ────────────────────────────────────────────────────────
+
+function parseConcurrency(raw: string | undefined): number {
+  if (!raw) return DEFAULT_CONCURRENCY;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_CONCURRENCY;
+  return Math.min(n, 16); // hard cap
+}
+
+async function runPool<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) return;
+      results[idx] = await worker(items[idx]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+// ── Per-fact analysis ───────────────────────────────────────────────────────
+
+interface PerFactOutcome {
+  finding: ClaudeFinding;
+  error: boolean;
+  cached: boolean;
+}
+
+export type FactWorker = (fact: Fact) => Promise<ClaudeFinding>;
+
+async function analyzeFact(
+  fact: Fact,
+  worker: FactWorker,
+  repoSha: string | null,
+): Promise<PerFactOutcome> {
+  const factHash = hashFact(fact);
+
+  if (repoSha) {
+    const cached = await getCachedDriftFinding(factHash, repoSha);
+    if (cached) {
+      return {
+        cached: true,
+        error: false,
+        finding: {
+          fact_id: fact.id!,
+          consistent: cached.consistent,
+          evidence: cached.evidence,
+          question: cached.question,
+        },
+      };
+    }
+  }
+
+  try {
+    const finding = await worker(fact);
+    if (repoSha) {
+      await upsertDriftCache(factHash, repoSha, {
+        consistent: finding.consistent,
+        evidence: finding.evidence,
+        question: finding.question,
+      });
+    }
+    return { finding, error: false, cached: false };
+  } catch (err) {
+    const msg = (err as Error).message || String(err);
+    return {
+      error: true,
+      cached: false,
+      finding: {
+        fact_id: fact.id!,
+        consistent: false,
+        evidence: `drift analysis failed: ${msg.slice(0, 200)}`,
+        question: null,
+      },
+    };
+  }
+}
+
+// ── Worker factories ────────────────────────────────────────────────────────
+
+function makeCliWorker(workDir: string): FactWorker {
+  return async (fact) => {
+    const prompt = buildPerFactPrompt(fact);
+    const raw = await invokeClaudeCode(prompt, workDir);
+    return parsePerFactOutput(raw, fact.id!);
+  };
+}
+
+function makePackedWorker(packedRepo: string): FactWorker {
+  return async (fact) => invokePackedSdk({ packedRepo, fact });
+}
+
+type PackMode = "repomix" | "cli";
+
+function resolvePackMode(): PackMode {
+  const raw = process.env.WHATSON_DRIFT_PACK_MODE?.toLowerCase();
+  if (raw === "cli") return "cli";
+  return "repomix";
+}
+
+function parseMaxPackBytes(raw: string | undefined): number {
+  const DEFAULT = 3_000_000;
+  if (!raw) return DEFAULT;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT;
+  return n;
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
 export async function runDriftAnalysis(): Promise<DriftAnalysisResult> {
-  // Gate: opt-in via env
   if (process.env.WHATSON_DRIFT_ENABLED !== "true") {
-    return {
-      skipped: "WHATSON_DRIFT_ENABLED is not 'true'",
-      factsAnalyzed: 0,
-      findings: 0,
-      inconsistencies: 0,
-      questionsGenerated: 0,
-    };
+    return skip("WHATSON_DRIFT_ENABLED is not 'true'");
   }
 
-  // Gate: drift needs tool access (Read/Grep/Glob/Bash) to scan the target
-  // repo, which the SDK backend cannot provide. Refuse if the resolver
-  // returns "sdk" for this component.
-  if (resolveBackend("drift") !== "cli") {
-    return {
-      skipped: "drift requires LLM_BACKEND_DRIFT=cli (needs tool access)",
-      factsAnalyzed: 0,
-      findings: 0,
-      inconsistencies: 0,
-      questionsGenerated: 0,
-    };
-  }
-
-  // Gate: claude binary must exist
-  if (!claudeExists()) {
-    return {
-      skipped: "claude CLI not found on PATH",
-      factsAnalyzed: 0,
-      findings: 0,
-      inconsistencies: 0,
-      questionsGenerated: 0,
-    };
-  }
-
-  // Gate: target repo must be cloned
   const cfg = getRepoSyncConfig();
   const workDir = cfg?.workDir ?? DEFAULT_WORKDIR;
   if (!fs.existsSync(path.join(workDir, ".git"))) {
-    return {
-      skipped: "target repo not cloned (run sync first)",
-      factsAnalyzed: 0,
-      findings: 0,
-      inconsistencies: 0,
-      questionsGenerated: 0,
-    };
+    return skip("target repo not cloned (run sync first)");
   }
 
-  // Gather facts to analyze: decisions + high-confidence facts
   const allFacts = await getActiveFacts();
   const factsToAnalyze = allFacts.filter(
     (f) => f.source_type === "decision" || f.confidence === "high"
   );
 
   if (factsToAnalyze.length === 0) {
-    return {
-      skipped: "no high-confidence decisions or facts to analyze",
-      factsAnalyzed: 0,
-      findings: 0,
-      inconsistencies: 0,
-      questionsGenerated: 0,
-    };
+    return skip("no high-confidence decisions or facts to analyze");
   }
 
-  // Build prompt and invoke Claude Code
-  const prompt = buildAnalysisPrompt(factsToAnalyze);
-  const rawOutput = invokeClaudeCode(prompt, workDir);
-  const findings = parseClaudeOutput(rawOutput);
+  // Resolve worker: repomix+SDK by default, CLI as opt-out or auto-fallback
+  // when the packed repo exceeds the context ceiling.
+  const mode = resolvePackMode();
+  const maxPackBytes = parseMaxPackBytes(process.env.WHATSON_DRIFT_MAX_PACK_BYTES);
+  let worker: FactWorker;
 
-  // Store findings
+  if (mode === "repomix") {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return skip("repomix drift path requires ANTHROPIC_API_KEY (set WHATSON_DRIFT_PACK_MODE=cli to use subscription)");
+    }
+    let packed: string;
+    try {
+      packed = await packRepo(workDir);
+    } catch (err) {
+      return skip(`repomix failed: ${(err as Error).message.slice(0, 200)}`);
+    }
+    const packBytes = Buffer.byteLength(packed, "utf-8");
+
+    try {
+      fs.mkdirSync(path.dirname(LATEST_PACK_PATH), { recursive: true });
+      fs.writeFileSync(LATEST_PACK_PATH, packed, "utf-8");
+      console.error(`[drift] packed repo persisted to ${LATEST_PACK_PATH} (${packBytes} bytes)`);
+    } catch (e) {
+      console.error("[drift] failed to persist pack:", e);
+    }
+
+    const model = process.env.WHATSON_DRIFT_MODEL ?? "claude-sonnet-4-6";
+    if (packBytes > maxPackBytes) {
+      if (!claudeExists()) {
+        return skip(`packed repo ${packBytes}B exceeds ${maxPackBytes}B ceiling and claude CLI fallback not on PATH`);
+      }
+      console.error(`[drift] mode=repomix packBytes=${packBytes} exceeds ceiling=${maxPackBytes} → falling back worker=cli`);
+      worker = makeCliWorker(workDir);
+    } else {
+      console.error(`[drift] mode=repomix packBytes=${packBytes} worker=sdk model=${model}`);
+      worker = makePackedWorker(packed);
+    }
+
+    if (process.env.WHATSON_DRIFT_DRY_RUN === "true") {
+      return skip(`dry run — pack written to ${LATEST_PACK_PATH} (${packBytes} bytes), would use ${packBytes > maxPackBytes ? "cli" : "sdk"} worker`);
+    }
+  } else {
+    if (!claudeExists()) {
+      return skip("claude CLI not found on PATH");
+    }
+    console.error(`[drift] mode=cli worker=claude-p workDir=${workDir}`);
+    worker = makeCliWorker(workDir);
+  }
+
   const runAt = new Date().toISOString();
+  const concurrency = parseConcurrency(process.env.WHATSON_DRIFT_CONCURRENCY);
+  const repoSha = getRepoSha(workDir);
+
   let inconsistencies = 0;
   let questionsGenerated = 0;
+  let errors = 0;
+  let cacheHits = 0;
 
-  for (const f of findings) {
+  // Process with bounded concurrency; persist each finding as it completes so
+  // a crash mid-run still leaves partial progress in the DB.
+  const outcomes = await runPool(factsToAnalyze, concurrency, async (fact) => {
+    const outcome = await analyzeFact(fact, worker, repoSha);
     await insertDriftFinding({
       run_at: runAt,
-      fact_id: f.fact_id,
-      consistent: f.consistent,
-      evidence: f.evidence,
-      question: f.question,
+      fact_id: fact.id!,
+      consistent: outcome.finding.consistent,
+      evidence: outcome.finding.evidence,
+      question: outcome.finding.question,
     });
-    if (!f.consistent) inconsistencies++;
-    if (f.question) questionsGenerated++;
+    return outcome;
+  });
+
+  for (const outcome of outcomes) {
+    if (outcome.error) errors++;
+    if (outcome.cached) cacheHits++;
+    if (!outcome.finding.consistent) inconsistencies++;
+    if (outcome.finding.question) questionsGenerated++;
   }
 
   return {
     factsAnalyzed: factsToAnalyze.length,
-    findings: findings.length,
+    findings: outcomes.length,
     inconsistencies,
     questionsGenerated,
+    errors: errors > 0 ? errors : undefined,
+    cacheHits: cacheHits > 0 ? cacheHits : undefined,
+  };
+}
+
+function skip(reason: string): DriftAnalysisResult {
+  return {
+    skipped: reason,
+    factsAnalyzed: 0,
+    findings: 0,
+    inconsistencies: 0,
+    questionsGenerated: 0,
   };
 }
 
@@ -299,8 +459,9 @@ export async function formatDriftSummary(
   if ("skipped" in result) return `Drift analysis: skipped (${result.skipped})`;
   if ("error" in result) return `Drift analysis: error — ${result.error}`;
 
+  const cacheNote = result.cacheHits ? ` (${result.cacheHits} cached)` : "";
   if (result.inconsistencies === 0) {
-    return `Drift analysis: ${result.factsAnalyzed} facts checked, all consistent`;
+    return `Drift analysis: ${result.factsAnalyzed} facts checked, all consistent${cacheNote}`;
   }
 
   const findings = await getDriftFindings();
@@ -309,9 +470,10 @@ export async function formatDriftSummary(
   const facts = await getFactsByIds(factIds);
   const factMap = new Map(facts.map((f) => [f.id!, f]));
 
-  const lines: string[] = [
-    `Drift analysis: ${result.inconsistencies} inconsistencies found (${result.factsAnalyzed} facts checked)`,
-  ];
+  const headline = result.errors
+    ? `Drift analysis: ${result.inconsistencies} inconsistencies, ${result.errors} errors (${result.factsAnalyzed} facts checked${cacheNote})`
+    : `Drift analysis: ${result.inconsistencies} inconsistencies found (${result.factsAnalyzed} facts checked${cacheNote})`;
+  const lines: string[] = [headline];
 
   for (const finding of inconsistent) {
     const fact = factMap.get(finding.fact_id);

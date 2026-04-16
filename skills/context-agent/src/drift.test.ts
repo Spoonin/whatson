@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { _setDbForTest, insertFact, getDriftFindings, getUnansweredQuestions, type Fact } from "./storage.js";
-import { buildAnalysisPrompt, parseClaudeOutput } from "./drift.js";
+import { describe, it, expect, beforeEach } from "vitest";
+import { _setDbForTest, insertFact, getActiveFacts, getDriftFindings, getUnansweredQuestions, getCachedDriftFinding, upsertDriftCache, type Fact } from "./storage.js";
+import { buildPerFactPrompt, parsePerFactOutput, hashFact } from "./drift.js";
 
 function makeFact(
   overrides: Partial<Omit<Fact, "id" | "created_at" | "updated_at">> = {}
@@ -27,88 +27,78 @@ describe("drift analysis", () => {
     await _setDbForTest();
   });
 
-  describe("buildAnalysisPrompt", () => {
-    it("includes all facts with IDs in the prompt", async () => {
-      const id1 = await insertFact(makeFact({
+  describe("buildPerFactPrompt", () => {
+    it("includes fact id, content, source, and date in a single-fact prompt", async () => {
+      const id = await insertFact(makeFact({
         content: "Use PostgreSQL 16",
-        source_type: "decision",
-        confidence: "high",
-      }));
-      const id2 = await insertFact(makeFact({
-        content: "API rate limit is 1000 req/min",
-        source_type: "fact",
-        confidence: "high",
-      }));
-
-      const { getActiveFacts } = await import("./storage.js");
-      const facts = await getActiveFacts();
-      const prompt = buildAnalysisPrompt(facts);
-
-      expect(prompt).toContain(`ID=${id1}`);
-      expect(prompt).toContain(`ID=${id2}`);
-      expect(prompt).toContain("Use PostgreSQL 16");
-      expect(prompt).toContain("API rate limit is 1000 req/min");
-      expect(prompt).toContain("codebase consistency auditor");
-    });
-
-    it("includes source and date for each fact", async () => {
-      await insertFact(makeFact({
-        content: "Deploy to AWS",
         source: "telegram:@alice",
         source_type: "decision",
+        confidence: "high",
       }));
 
-      const { getActiveFacts } = await import("./storage.js");
       const facts = await getActiveFacts();
-      const prompt = buildAnalysisPrompt(facts);
+      const fact = facts.find((f) => f.id === id)!;
+      const prompt = buildPerFactPrompt(fact);
 
+      expect(prompt).toContain(`ID: ${id}`);
+      expect(prompt).toContain("Use PostgreSQL 16");
       expect(prompt).toContain("telegram:@alice");
       expect(prompt).toContain("decision");
+      expect(prompt).toContain("codebase consistency auditor");
+      // Prompt should instruct the model to return a single JSON object,
+      // not an array of findings.
+      expect(prompt).not.toContain("findings");
+      expect(prompt).toContain(`"fact_id": ${id}`);
     });
   });
 
-  describe("parseClaudeOutput", () => {
-    it("parses direct JSON findings", () => {
+  describe("parsePerFactOutput", () => {
+    it("parses a direct single-finding JSON object", () => {
       const raw = JSON.stringify({
-        findings: [
-          { fact_id: 1, consistent: true, evidence: "found in config.ts:12", question: null },
-          { fact_id: 2, consistent: false, evidence: "missing from codebase", question: "Is the rate limit implemented?" },
-        ],
+        fact_id: 7,
+        consistent: true,
+        evidence: "found in config.ts:12",
+        question: null,
       });
-      const findings = parseClaudeOutput(raw);
-      expect(findings).toHaveLength(2);
-      expect(findings[0].consistent).toBe(true);
-      expect(findings[1].consistent).toBe(false);
-      expect(findings[1].question).toBe("Is the rate limit implemented?");
+      const finding = parsePerFactOutput(raw, 7);
+      expect(finding.fact_id).toBe(7);
+      expect(finding.consistent).toBe(true);
+      expect(finding.evidence).toBe("found in config.ts:12");
+      expect(finding.question).toBeNull();
     });
 
-    it("parses Claude --output-format json wrapper", () => {
+    it("unwraps the --output-format json envelope", () => {
       const inner = JSON.stringify({
-        findings: [
-          { fact_id: 1, consistent: true, evidence: "ok", question: null },
-        ],
+        fact_id: 3,
+        consistent: false,
+        evidence: "missing from codebase",
+        question: "Is the rate limit implemented?",
       });
       const raw = JSON.stringify({ result: inner });
-      const findings = parseClaudeOutput(raw);
-      expect(findings).toHaveLength(1);
-      expect(findings[0].fact_id).toBe(1);
+      const finding = parsePerFactOutput(raw, 3);
+      expect(finding.consistent).toBe(false);
+      expect(finding.question).toBe("Is the rate limit implemented?");
     });
 
-    it("strips markdown fences from model output", () => {
-      const json = JSON.stringify({
-        findings: [{ fact_id: 1, consistent: true, evidence: "ok", question: null }],
-      });
+    it("strips markdown fences", () => {
+      const json = JSON.stringify({ fact_id: 1, consistent: true, evidence: "ok", question: null });
       const raw = "```json\n" + json + "\n```";
-      const findings = parseClaudeOutput(raw);
-      expect(findings).toHaveLength(1);
+      const finding = parsePerFactOutput(raw, 1);
+      expect(finding.consistent).toBe(true);
+    });
+
+    it("falls back to expectedFactId when fact_id is missing or wrong type", () => {
+      const raw = JSON.stringify({ consistent: true, evidence: "ok", question: null });
+      const finding = parsePerFactOutput(raw, 42);
+      expect(finding.fact_id).toBe(42);
     });
 
     it("throws on malformed output", () => {
-      expect(() => parseClaudeOutput("not json")).toThrow();
+      expect(() => parsePerFactOutput("not json", 1)).toThrow();
     });
 
-    it("throws when findings array is missing", () => {
-      expect(() => parseClaudeOutput('{"result": "no findings here"}')).toThrow("findings");
+    it("throws when 'consistent' boolean is missing", () => {
+      expect(() => parsePerFactOutput('{"fact_id": 1}', 1)).toThrow("consistent");
     });
   });
 
@@ -166,6 +156,56 @@ describe("drift analysis", () => {
       const findings = await getDriftFindings();
       expect(findings).toHaveLength(1);
       expect(findings[0].run_at).toBe("2026-04-12T10:00:00Z");
+    });
+
+    it("caches findings by fact hash + repo sha and invalidates on sha change", async () => {
+      const factId = await insertFact(makeFact({
+        content: "Use Redis for caching",
+        source_type: "decision",
+        confidence: "high",
+      }));
+      const facts = await getActiveFacts();
+      const fact = facts.find((f) => f.id === factId)!;
+      const factHash = hashFact(fact);
+
+      expect(await getCachedDriftFinding(factHash, "sha-a")).toBeNull();
+
+      await upsertDriftCache(factHash, "sha-a", {
+        consistent: false,
+        evidence: "missing redis",
+        question: "where is redis?",
+      });
+
+      const hit = await getCachedDriftFinding(factHash, "sha-a");
+      expect(hit).not.toBeNull();
+      expect(hit!.consistent).toBe(false);
+      expect(hit!.evidence).toBe("missing redis");
+      expect(hit!.question).toBe("where is redis?");
+
+      // Different repo sha → cache miss (repo state changed).
+      expect(await getCachedDriftFinding(factHash, "sha-b")).toBeNull();
+
+      // Upsert overwrites for same key.
+      await upsertDriftCache(factHash, "sha-a", {
+        consistent: true,
+        evidence: "found it",
+        question: null,
+      });
+      const updated = await getCachedDriftFinding(factHash, "sha-a");
+      expect(updated!.consistent).toBe(true);
+      expect(updated!.question).toBeNull();
+    });
+
+    it("hashFact differs when content or source_type differs", async () => {
+      const a = await insertFact(makeFact({ content: "X", source_type: "decision" }));
+      const b = await insertFact(makeFact({ content: "Y", source_type: "decision" }));
+      const c = await insertFact(makeFact({ content: "X", source_type: "fact" }));
+      const facts = await getActiveFacts();
+      const fa = facts.find((f) => f.id === a)!;
+      const fb = facts.find((f) => f.id === b)!;
+      const fc = facts.find((f) => f.id === c)!;
+      expect(hashFact(fa)).not.toBe(hashFact(fb));
+      expect(hashFact(fa)).not.toBe(hashFact(fc));
     });
 
     it("returns unanswered questions", async () => {

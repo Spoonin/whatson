@@ -143,23 +143,30 @@ export async function _setDbForTest(db?: DB): Promise<DB> {
 // Single-shot schema creation. Bump SCHEMA_VERSION to nuke and recreate.
 // Safe while all data is test data; swap to proper migrations for production.
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 function migrate(db: DB): void {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
   if (row.user_version === SCHEMA_VERSION) return;
 
-  // Wipe stale schema (tables + triggers + indexes)
+  // Wipe stale schema (tables + triggers + indexes). FKs must be OFF during
+  // the drop phase — otherwise dropping a parent table (e.g. `facts`) fails
+  // while child tables (`drift_findings`, `fact_embeddings`, …) still exist.
   if (row.user_version !== 0) {
-    const objects = db
-      .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
-      .all() as { type: string; name: string }[];
-    for (const { type, name } of objects) {
-      if (type === "table" || type === "view") {
-        db.exec(`DROP TABLE IF EXISTS "${name}"`);
-      } else if (type === "trigger") {
-        db.exec(`DROP TRIGGER IF EXISTS "${name}"`);
+    db.pragma("foreign_keys = OFF");
+    try {
+      const objects = db
+        .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+        .all() as { type: string; name: string }[];
+      for (const { type, name } of objects) {
+        if (type === "table" || type === "view") {
+          db.exec(`DROP TABLE IF EXISTS "${name}"`);
+        } else if (type === "trigger") {
+          db.exec(`DROP TRIGGER IF EXISTS "${name}"`);
+        }
       }
+    } finally {
+      db.pragma("foreign_keys = ON");
     }
   }
 
@@ -240,6 +247,16 @@ function migrate(db: DB): void {
     );
     CREATE INDEX idx_drift_run ON drift_findings(run_at);
     CREATE INDEX idx_drift_unanswered ON drift_findings(addressed, question);
+
+    CREATE TABLE drift_cache (
+      fact_hash   TEXT    NOT NULL,
+      repo_sha    TEXT    NOT NULL,
+      consistent  INTEGER NOT NULL,
+      evidence    TEXT,
+      question    TEXT,
+      cached_at   TEXT    NOT NULL,
+      PRIMARY KEY (fact_hash, repo_sha)
+    ) WITHOUT ROWID;
   `);
 
   // ── FTS5: facts ──
@@ -620,6 +637,62 @@ export async function addressDriftFinding(id: number): Promise<void> {
   db.prepare("UPDATE drift_findings SET addressed = 1, addressed_at = @now WHERE id = @id").run({
     now,
     id,
+  });
+}
+
+// ── Drift cache ──────────────────────────────────────────────────────────────
+
+export interface DriftCacheEntry {
+  consistent: boolean;
+  evidence: string | null;
+  question: string | null;
+}
+
+interface DriftCacheRow {
+  consistent: number;
+  evidence: string | null;
+  question: string | null;
+}
+
+export async function getCachedDriftFinding(
+  factHash: string,
+  repoSha: string,
+): Promise<DriftCacheEntry | null> {
+  const db = await getDb();
+  const row = db
+    .prepare(
+      "SELECT consistent, evidence, question FROM drift_cache WHERE fact_hash = ? AND repo_sha = ?"
+    )
+    .get(factHash, repoSha) as DriftCacheRow | undefined;
+  if (!row) return null;
+  return {
+    consistent: row.consistent === 1,
+    evidence: row.evidence,
+    question: row.question,
+  };
+}
+
+export async function upsertDriftCache(
+  factHash: string,
+  repoSha: string,
+  entry: DriftCacheEntry,
+): Promise<void> {
+  const db = await getDb();
+  db.prepare(
+    `INSERT INTO drift_cache (fact_hash, repo_sha, consistent, evidence, question, cached_at)
+     VALUES (@fact_hash, @repo_sha, @consistent, @evidence, @question, @cached_at)
+     ON CONFLICT(fact_hash, repo_sha) DO UPDATE SET
+       consistent = excluded.consistent,
+       evidence = excluded.evidence,
+       question = excluded.question,
+       cached_at = excluded.cached_at`
+  ).run({
+    fact_hash: factHash,
+    repo_sha: repoSha,
+    consistent: entry.consistent ? 1 : 0,
+    evidence: entry.evidence ?? null,
+    question: entry.question ?? null,
+    cached_at: new Date().toISOString(),
   });
 }
 

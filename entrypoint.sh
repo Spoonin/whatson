@@ -20,10 +20,32 @@ if [ -d "$PROMPTS_SRC" ]; then
   done
 fi
 
-# Register context-agent MCP server (idempotent — overwrites if exists).
-# OpenClaw's `mcp set` accepts an `env` object; we pass an explicit allowlist
-# because the gateway does not forward the container's env to spawned MCP
-# stdio servers by default.
+# ── Step 1: Seed gateway + channels (no "agent" key — mcp set rejects it) ──
+CONFIG_FILE="/home/node/.openclaw/openclaw.json"
+echo "[entrypoint] Ensuring gateway config..."
+mkdir -p /home/node/.openclaw
+node -e '
+  const fs = require("fs");
+  const path = "'"$CONFIG_FILE"'";
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(path, "utf8")); } catch {}
+  cfg.gateway = Object.assign(cfg.gateway || {}, { mode: "local" });
+  if (!cfg.channels) cfg.channels = {};
+  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (tgToken) {
+    cfg.channels.telegram = Object.assign(cfg.channels.telegram || {}, {
+      enabled: true,
+      botToken: tgToken,
+      dmPolicy: "pairing"
+    });
+  }
+  // Remove agent key before mcp set (mcp set validator rejects it)
+  const agent = cfg.agent;
+  delete cfg.agent;
+  fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
+'
+
+# ── Step 2: Register MCP server (needs valid config without "agent") ────────
 echo "[entrypoint] Registering context-agent MCP server..."
 export MCP_SCRIPT="$SKILL_DIR/dist/mcp-server.js"
 MCP_CONFIG_JSON=$(node -e '
@@ -39,6 +61,10 @@ MCP_CONFIG_JSON=$(node -e '
     "WHATSON_SYNC_EVERY_N_CONSOLIDATION",
     "WHATSON_DRIFT_ENABLED",
     "WHATSON_DRIFT_MODEL",
+    "WHATSON_DRIFT_PACK_MODE",
+    "WHATSON_DRIFT_MAX_PACK_BYTES",
+    "WHATSON_DRIFT_CONCURRENCY",
+    "WHATSON_DRIFT_DRY_RUN",
     "LLM_BACKEND",
     "LLM_BACKEND_EXTRACT",
     "LLM_BACKEND_CONSOLIDATION",
@@ -61,5 +87,9 @@ MCP_CONFIG_JSON=$(node -e '
 ')
 cd /app
 node dist/index.js mcp set context-agent "$MCP_CONFIG_JSON" 2>&1 || echo "[entrypoint] WARNING: mcp set failed (non-fatal)"
+
+# ── Step 3: Set agent model via CLI (after mcp set) ─────────────────────────
+echo "[entrypoint] Setting agent model..."
+node dist/index.js config set agents.defaults.model anthropic/claude-sonnet-4-6 2>&1 || echo "[entrypoint] WARNING: model set failed (non-fatal)"
 
 exec node dist/index.js gateway "$@"

@@ -8,9 +8,24 @@
 import { processMessage, processMessageWithUrls, processMessageLlm, processMessageWithUrlsLlm } from "./wal.js";
 import { extractUrls } from "./url-fetch.js";
 import { insertFact, insertDocument, searchFacts, addressDriftFinding, insertFactEmbedding, type Fact, type SourceType, type Confidence } from "./storage.js";
-import { runConsolidation, normalize, contentOverlaps, type ConsolidationSummary } from "./consolidation.js";
+import {
+  runConsolidation,
+  normalize,
+  contentOverlaps,
+  kickOffConsolidation,
+  getConsolidationRunState,
+  getLatestConsolidationReport,
+  type ConsolidationSummary,
+  type ConsolidationRunState,
+  type KickOffResult,
+  clearDriftHeartbeatFlag,
+} from "./consolidation.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
-import { renderProjectDoc, type RenderResult, type RenderOptions } from "./render.js";
+import {
+  renderProjectDoc, renderArchitectureDoc, renderDecisionsDoc,
+  renderQuestionsDoc, renderRequirementsDoc, renderStatusDoc, renderAll,
+  type RenderResult, type RenderOptions,
+} from "./render.js";
 import { retrieve, getStatus, type RetrievalResult } from "./retrieval.js";
 import { embedText } from "./embeddings.js";
 import type { ExtractedFact } from "./llm-extract.js";
@@ -263,8 +278,38 @@ export async function storage_query(args: {
 
 // ── Tool: consolidate ─────────────────────────────────────────────────────────
 
-export async function consolidate(): Promise<ConsolidationSummary> {
-  return runConsolidation();
+export async function consolidate(): Promise<ConsolidationSummary & { renderResults: RenderResult[] | { error: string } }> {
+  const summary = await runConsolidation();
+  let renderResults: RenderResult[] | { error: string };
+  try {
+    renderResults = await renderAll();
+  } catch (e) {
+    renderResults = { error: e instanceof Error ? e.message : String(e) };
+  }
+  return { ...summary, renderResults };
+}
+
+// ── Tool: consolidate_start (detached) ──────────────────────────────────────
+
+/**
+ * Kick off consolidation in the background and return immediately. The MCP
+ * tool wraps this so the gateway doesn't block (and time out) on multi-minute
+ * LLM consolidation runs. Results are available via `consolidate_status`.
+ */
+export function consolidate_start(): KickOffResult {
+  return kickOffConsolidation(() => consolidate());
+}
+
+// ── Tool: consolidate_status ────────────────────────────────────────────────
+
+export function consolidate_status(): {
+  state: ConsolidationRunState;
+  report: string | null;
+} {
+  return {
+    state: getConsolidationRunState(),
+    report: getLatestConsolidationReport(),
+  };
 }
 
 // ── Tool: sync_repo ───────────────────────────────────────────────────────────
@@ -277,6 +322,30 @@ export async function sync_repo(): Promise<RepoSyncResult> {
 
 export async function render_project(args: RenderOptions = {}): Promise<RenderResult> {
   return renderProjectDoc(args);
+}
+
+export async function render_architecture(args: RenderOptions = {}): Promise<RenderResult> {
+  return renderArchitectureDoc(args);
+}
+
+export async function render_decisions(args: RenderOptions = {}): Promise<RenderResult> {
+  return renderDecisionsDoc(args);
+}
+
+export async function render_questions(args: RenderOptions = {}): Promise<RenderResult> {
+  return renderQuestionsDoc(args);
+}
+
+export async function render_requirements(args: RenderOptions = {}): Promise<RenderResult> {
+  return renderRequirementsDoc(args);
+}
+
+export async function render_status(args: RenderOptions = {}): Promise<RenderResult> {
+  return renderStatusDoc(args);
+}
+
+export async function render_all(args: RenderOptions = {}): Promise<RenderResult[]> {
+  return renderAll(args);
 }
 
 // ── Tool: get_status ──────────────────────────────────────────────────────────
@@ -308,7 +377,10 @@ export async function get_drift_report(): Promise<{
   latestFindings: import("./storage.js").DriftFinding[];
   unansweredQuestions: import("./storage.js").DriftFinding[];
 }> {
-  return getDriftReport();
+  const report = getDriftReport();
+  // Clear the heartbeat flag now that the agent has read the report
+  clearDriftHeartbeatFlag();
+  return report;
 }
 
 // ── Tool: resolve_drift_finding ─────────────────────────────────────────────

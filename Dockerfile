@@ -1,7 +1,7 @@
 FROM ghcr.io/openclaw/openclaw:latest
 
 USER root
-RUN npm install -g @anthropic-ai/claude-code && \
+RUN npm install -g @anthropic-ai/claude-code repomix && \
     mkdir -p /opt/whatson-skills && chown -R node:node /opt/whatson-skills
 USER node
 

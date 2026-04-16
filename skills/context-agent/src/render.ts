@@ -25,6 +25,13 @@ const TEMPLATE_DIR = path.resolve(__dirname, "../templates");
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
+export interface ArtifactConfig {
+  artifact: string;             // output filename, e.g. "PROJECT.md"
+  templateName: string;         // template file under templates/
+  defaultTags: string[];        // fact tag filter (OR semantics)
+  defaultSourceTypes?: string[]; // fact source_type filter (OR semantics)
+}
+
 export interface FactPackFact {
   id: string;              // "f:42"
   content: string;
@@ -191,41 +198,66 @@ export function verifyCitations(
   return violations;
 }
 
-// ── Main entry point ────────────────────────────────────────────────────────
+// ── Artifact configs ─────────────────────────────────────────────────────────
 
-const DEFAULT_PROJECT_TAGS = [
-  "overview",
-  "objectives",
-  "kpi",
-  "architecture",
-  "technology",
-  "deployment",
-  "roadmap",
-  "safety",
-  "security",
-  "sandbox",
-  "control",
-  "skill-audit",
-  "performance",
-  "accuracy",
-  "autonomy",
-  "evolution",
-  "learning",
-  "trading",
-];
+const PROJECT_CONFIG: ArtifactConfig = {
+  artifact: "PROJECT.md",
+  templateName: "project.md",
+  defaultTags: [
+    "overview", "objectives", "kpi", "architecture", "technology",
+    "deployment", "roadmap", "safety", "security", "sandbox", "control",
+    "skill-audit", "performance", "accuracy", "autonomy", "evolution",
+    "learning", "trading",
+  ],
+};
 
-export async function renderProjectDoc(
+const ARCHITECTURE_CONFIG: ArtifactConfig = {
+  artifact: "ARCHITECTURE.md",
+  templateName: "architecture.md",
+  defaultTags: ["architecture", "technology", "deployment"],
+};
+
+const DECISIONS_CONFIG: ArtifactConfig = {
+  artifact: "DECISIONS.md",
+  templateName: "decisions.md",
+  defaultTags: [],
+  defaultSourceTypes: ["decision", "correction"],
+};
+
+const QUESTIONS_CONFIG: ArtifactConfig = {
+  artifact: "QUESTIONS.md",
+  templateName: "questions.md",
+  defaultTags: [],
+  defaultSourceTypes: ["question"],
+};
+
+const REQUIREMENTS_CONFIG: ArtifactConfig = {
+  artifact: "REQUIREMENTS.md",
+  templateName: "requirements.md",
+  defaultTags: ["objectives", "kpi", "performance", "accuracy", "trading"],
+};
+
+const STATUS_CONFIG: ArtifactConfig = {
+  artifact: "STATUS.md",
+  templateName: "status.md",
+  defaultTags: ["overview", "roadmap", "deployment"],
+};
+
+// ── Generic render ────────────────────────────────────────────────────────────
+
+async function renderArtifact(
+  config: ArtifactConfig,
   opts: RenderOptions = {}
 ): Promise<RenderResult> {
   const outputDir = opts.outputDir ?? DEFAULT_OUTPUT_DIR;
-  const templateName = opts.templateName ?? "project.md";
-  const artifact = "PROJECT.md";
+  const templateName = opts.templateName ?? config.templateName;
+  const artifact = config.artifact;
 
   const template = loadTemplate(templateName);
   const all = await getActiveFacts();
   const filtered = filterFacts(all, {
-    tags: opts.tags ?? DEFAULT_PROJECT_TAGS,
-    sourceTypes: opts.sourceTypes,
+    tags: opts.tags ?? config.defaultTags,
+    sourceTypes: opts.sourceTypes ?? config.defaultSourceTypes,
   });
 
   if (filtered.length === 0) {
@@ -262,13 +294,7 @@ export async function renderProjectDoc(
   const violations = verifyCitations(rendered, validIds);
 
   if (violations.length > 0) {
-    return {
-      artifact,
-      factCount: filtered.length,
-      verified: false,
-      violations,
-      backend,
-    };
+    return { artifact, factCount: filtered.length, verified: false, violations, backend };
   }
 
   fs.mkdirSync(outputDir, { recursive: true });
@@ -286,4 +312,41 @@ export async function renderProjectDoc(
     backend,
     gitPush: { committed: sync.committed, pushed: sync.pushed, commitSha: sync.commitSha, skipped: sync.skipped },
   };
+}
+
+// ── Public render functions ───────────────────────────────────────────────────
+
+export async function renderProjectDoc(opts: RenderOptions = {}): Promise<RenderResult> {
+  return renderArtifact(PROJECT_CONFIG, opts);
+}
+
+export async function renderArchitectureDoc(opts: RenderOptions = {}): Promise<RenderResult> {
+  return renderArtifact(ARCHITECTURE_CONFIG, opts);
+}
+
+export async function renderDecisionsDoc(opts: RenderOptions = {}): Promise<RenderResult> {
+  return renderArtifact(DECISIONS_CONFIG, opts);
+}
+
+export async function renderQuestionsDoc(opts: RenderOptions = {}): Promise<RenderResult> {
+  return renderArtifact(QUESTIONS_CONFIG, opts);
+}
+
+export async function renderRequirementsDoc(opts: RenderOptions = {}): Promise<RenderResult> {
+  return renderArtifact(REQUIREMENTS_CONFIG, opts);
+}
+
+export async function renderStatusDoc(opts: RenderOptions = {}): Promise<RenderResult> {
+  return renderArtifact(STATUS_CONFIG, opts);
+}
+
+export async function renderAll(opts: RenderOptions = {}): Promise<RenderResult[]> {
+  return Promise.all([
+    renderProjectDoc(opts),
+    renderArchitectureDoc(opts),
+    renderDecisionsDoc(opts),
+    renderQuestionsDoc(opts),
+    renderRequirementsDoc(opts),
+    renderStatusDoc(opts),
+  ]);
 }

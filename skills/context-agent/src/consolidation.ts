@@ -29,9 +29,157 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, "../data");
 const INDEX_PATH = path.join(DATA_DIR, "INDEX.md");
 const SESSION_STATE_PATH = path.join(DATA_DIR, "SESSION-STATE.md");
+const LATEST_REPORT_PATH = path.join(DATA_DIR, "LATEST-CONSOLIDATION.md");
 
 const INDEX_LINE_BUDGET = 200;
 const STALE_DAYS = 30;
+
+// OpenClaw workspace HEARTBEAT.md — the agent reads this on every heartbeat
+// poll and acts on pending tasks.
+const HEARTBEAT_PATH = "/home/node/.openclaw/workspace/HEARTBEAT.md";
+
+/**
+ * Write a heartbeat flag so the agent picks up drift results on the next poll.
+ * The flag is cleared when the agent calls get_drift_report (see index.ts).
+ */
+function writeDriftHeartbeatFlag(inconsistencies: number, questions: number): void {
+  try {
+    const content = [
+      `# Heartbeat Tasks`,
+      ``,
+      `## Drift analysis completed`,
+      `Drift analysis found ${inconsistencies} inconsistencies and generated ${questions} questions.`,
+      `Call \`context-agent__get_drift_report\` and relay all unanswered questions to the user immediately.`,
+      `After relaying, this task will auto-clear.`,
+    ].join("\n");
+    fs.writeFileSync(HEARTBEAT_PATH, content, "utf-8");
+    console.error(`[drift-bg] wrote heartbeat flag (${inconsistencies} inconsistencies, ${questions} questions)`);
+  } catch (e) {
+    console.error("[drift-bg] failed to write heartbeat flag:", e);
+  }
+}
+
+/** Clear the heartbeat drift flag (called after get_drift_report). */
+export function clearDriftHeartbeatFlag(): void {
+  try {
+    fs.writeFileSync(HEARTBEAT_PATH, "# No pending tasks\n", "utf-8");
+  } catch {
+    // ignore — file may not exist
+  }
+}
+
+// ── Background state (for detached consolidate) ────────────────────────────
+// Consolidation can take minutes (many LLM calls + sync). The MCP tool's
+// request window is much shorter, so callers kick off a background run and
+// poll `consolidate_status`. State is process-local — fine for the single
+// MCP server process; multi-process would need an external store.
+
+export interface ConsolidationRunState {
+  status: "idle" | "running" | "succeeded" | "failed";
+  runAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
+
+let _runState: ConsolidationRunState = {
+  status: "idle",
+  runAt: null,
+  startedAt: null,
+  finishedAt: null,
+  error: null,
+};
+
+export function getConsolidationRunState(): ConsolidationRunState {
+  return { ..._runState };
+}
+
+export function getLatestConsolidationReport(): string | null {
+  try {
+    return fs.readFileSync(LATEST_REPORT_PATH, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/** Test hook — reset the background state between runs. */
+export function _resetRunStateForTest(): void {
+  _runState = {
+    status: "idle",
+    runAt: null,
+    startedAt: null,
+    finishedAt: null,
+    error: null,
+  };
+}
+
+export interface KickOffResult {
+  started: boolean;
+  runAt: string | null;
+  reason?: string;
+}
+
+/**
+ * Kick off a consolidation run in the background and return immediately.
+ *
+ * The `work` callback should produce a final object with a `report` string
+ * (human-readable markdown) — typically `consolidate()` from index.ts, which
+ * runs `runConsolidation()` then `renderAll()`. Passing the worker as an
+ * argument keeps this module decoupled from render.ts.
+ *
+ * Guards against concurrent runs: a second call while still running returns
+ * `started: false` with the runAt of the in-flight run.
+ */
+export function kickOffConsolidation(
+  work: () => Promise<{ report: string }>,
+): KickOffResult {
+  if (_runState.status === "running") {
+    return {
+      started: false,
+      runAt: _runState.runAt,
+      reason: `already running (started ${_runState.startedAt})`,
+    };
+  }
+
+  const runAt = new Date().toISOString();
+  _runState = {
+    status: "running",
+    runAt,
+    startedAt: runAt,
+    finishedAt: null,
+    error: null,
+  };
+
+  work()
+    .then((summary) => {
+      try {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        fs.writeFileSync(LATEST_REPORT_PATH, summary.report, "utf-8");
+      } catch (e) {
+        console.error("[consolidate-bg] failed to write report:", e);
+      }
+      _runState = {
+        status: "succeeded",
+        runAt,
+        startedAt: _runState.startedAt,
+        finishedAt: new Date().toISOString(),
+        error: null,
+      };
+    })
+    .catch((e) => {
+      const err = e instanceof Error ? e.message : String(e);
+      console.error("[consolidate-bg]", err);
+      _runState = {
+        status: "failed",
+        runAt,
+        startedAt: _runState.startedAt,
+        finishedAt: new Date().toISOString(),
+        error: err,
+      };
+    });
+
+  return { started: true, runAt };
+}
 
 export interface ConsolidationSummary {
   runAt: string;
@@ -639,9 +787,10 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
     notes: repoSync ? JSON.stringify(repoSync) : null,
   });
 
-  // Phase 5: Drift Analysis — detached. Shells to Claude Code CLI which can
-  // take minutes; running it inline blocks the MCP response and causes the
-  // gateway to time out. Kick it off fire-and-forget; it logs its own row.
+  // Phase 5: Drift Analysis — fire-and-forget. Runs in background so
+  // consolidation can return quickly. When drift finishes with questions,
+  // it writes a flag to HEARTBEAT.md so the agent picks them up on the
+  // next heartbeat poll and relays them to the user.
   const driftAnalysis: { skipped: string } = { skipped: "running in background" };
   const t5 = Date.now();
   runDriftAnalysis()
@@ -656,6 +805,10 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
         duration_ms: Date.now() - t5,
         notes: JSON.stringify(result),
       });
+      // Signal the heartbeat if there are unanswered questions
+      if ("inconsistencies" in result && result.inconsistencies > 0) {
+        writeDriftHeartbeatFlag(result.inconsistencies, result.questionsGenerated);
+      }
     })
     .catch(async (e) => {
       const err = e instanceof Error ? e.message : String(e);

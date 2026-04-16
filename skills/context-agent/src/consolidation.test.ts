@@ -15,6 +15,9 @@ import {
   contentOverlaps,
   parseConsolidationResponse,
   clusterFacts,
+  kickOffConsolidation,
+  getConsolidationRunState,
+  _resetRunStateForTest,
   _setClientForTest,
 } from "./consolidation.js";
 
@@ -597,5 +600,84 @@ describe("LLM consolidation", () => {
 
     const active = await getActiveFacts();
     expect(active).toHaveLength(1);
+  });
+});
+
+// ── kickOffConsolidation ────────────────────────────────────────────────────
+
+describe("kickOffConsolidation (detached)", () => {
+  beforeEach(() => {
+    _resetRunStateForTest();
+  });
+
+  function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  it("returns started=true on first call and transitions state idle → running → succeeded", async () => {
+    expect(getConsolidationRunState().status).toBe("idle");
+
+    const d = deferred<{ report: string }>();
+    const kickoff = kickOffConsolidation(() => d.promise);
+    expect(kickoff.started).toBe(true);
+    expect(kickoff.runAt).toBeTruthy();
+    expect(getConsolidationRunState().status).toBe("running");
+
+    d.resolve({ report: "test report body" });
+    // Let the .then microtask drain
+    await new Promise((r) => setTimeout(r, 10));
+
+    const final = getConsolidationRunState();
+    expect(final.status).toBe("succeeded");
+    expect(final.error).toBeNull();
+    expect(final.finishedAt).toBeTruthy();
+  });
+
+  it("returns started=false with reason when a run is already in flight", async () => {
+    const d = deferred<{ report: string }>();
+    const first = kickOffConsolidation(() => d.promise);
+    expect(first.started).toBe(true);
+
+    const second = kickOffConsolidation(async () => ({ report: "should not run" }));
+    expect(second.started).toBe(false);
+    expect(second.reason).toMatch(/already running/);
+    expect(second.runAt).toBe(first.runAt);
+
+    // Clean up the in-flight run
+    d.resolve({ report: "done" });
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
+  it("transitions state to failed when the worker throws", async () => {
+    const d = deferred<{ report: string }>();
+    kickOffConsolidation(() => d.promise);
+
+    d.reject(new Error("boom"));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const final = getConsolidationRunState();
+    expect(final.status).toBe("failed");
+    expect(final.error).toBe("boom");
+  });
+
+  it("allows a fresh run after the previous one finished", async () => {
+    const d1 = deferred<{ report: string }>();
+    kickOffConsolidation(() => d1.promise);
+    d1.resolve({ report: "r1" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(getConsolidationRunState().status).toBe("succeeded");
+
+    const d2 = deferred<{ report: string }>();
+    const second = kickOffConsolidation(() => d2.promise);
+    expect(second.started).toBe(true);
+    d2.resolve({ report: "r2" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(getConsolidationRunState().status).toBe("succeeded");
   });
 });

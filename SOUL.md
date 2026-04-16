@@ -53,6 +53,16 @@ If `wal_append` returns a non-empty `conflicts` array, you MUST alert the user i
 
 When the user asks about prior context, previously-recorded knowledge, or anything that might already be in the store, call `context-agent__retrieve_context` with their question. Always cite sources and dates from the returned attribution block.
 
+## MANDATORY: Relay drift questions after consolidation
+
+After consolidation finishes (you see `state: "done"` from `consolidate_status`), you MUST:
+1. Call `context-agent__get_drift_report`
+2. If there are unanswered questions, present them to the user **immediately** — do not wait to be asked
+3. Format each question clearly, numbered, with the fact it relates to
+4. Ask the user to confirm, correct, or clarify each one
+
+Drift questions represent real inconsistencies between recorded decisions and actual code. They are the primary feedback loop — surfacing them is as important as recording facts.
+
 ## Response Metadata Footer
 
 Every reply ends with a single italicised footer line, on its own trailing line, in this exact format:

@@ -10,7 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { wal_append, storage_insert, storage_query, consolidate, sync_repo, get_status, retrieve_context, run_drift_analysis, get_drift_report, resolve_drift_finding } from "./index.js";
+import { wal_append, storage_insert, storage_query, consolidate_start, consolidate_status, sync_repo, get_status, retrieve_context, run_drift_analysis, get_drift_report, resolve_drift_finding } from "./index.js";
 import { backfillEmbeddings } from "./embeddings.js";
 
 const server = new McpServer({
@@ -118,14 +118,31 @@ server.tool(
 
 server.tool(
   "consolidate",
-  "Run the 5-phase consolidation loop: Orient, Gather, Consolidate (dedup + contradiction resolution), Prune & Index, Drift Analysis. Call this on schedule or when the user requests /consolidate.",
+  "Kick off the 5-phase consolidation loop (Orient, Gather, Consolidate, Prune & Index, Drift Analysis) in the background and return immediately. Consolidation can take minutes, so the MCP request would otherwise time out. Use `consolidate_status` to poll progress and read the final report. Call this on schedule or when the user requests /consolidate.",
   {},
   async () => {
-    const result = await consolidate();
+    const kickoff = consolidate_start();
+    const msg = kickoff.started
+      ? `Consolidation started at ${kickoff.runAt}. It runs in the background — call consolidate_status in ~30s to see progress and the final report.`
+      : `Consolidation not started: ${kickoff.reason}. Call consolidate_status to see the in-flight run (${kickoff.runAt}).`;
+    return {
+      content: [{ type: "text", text: msg }],
+    };
+  }
+);
+
+server.tool(
+  "consolidate_status",
+  "Return the state of the most recent consolidation run (idle / running / succeeded / failed) plus the formatted report if available. Call after `consolidate` to see progress and results.",
+  {},
+  async () => {
+    const { state, report } = consolidate_status();
+    const stateBlock = "```json\n" + JSON.stringify(state, null, 2) + "\n```";
+    const reportBlock = report ?? "_(no report yet — consolidation has not completed)_";
     return {
       content: [
-        { type: "text", text: result.report },
-        { type: "text", text: "\n\n<details>\n" + JSON.stringify(result, null, 2) + "\n</details>" },
+        { type: "text", text: stateBlock },
+        { type: "text", text: reportBlock },
       ],
     };
   }

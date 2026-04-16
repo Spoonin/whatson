@@ -89,8 +89,15 @@ Parameters:
 2. **Then**: Read the tool result to see what facts were extracted
 3. **Finally**: Respond to the user, mentioning what was recorded and the current fact count
 
+## Post-consolidation: drift questions
+
+After `/consolidate` completes, you MUST call `context-agent__get_drift_report` and relay any unanswered questions to the user. Do not wait to be asked. These questions represent inconsistencies between recorded decisions and actual code — the user needs to see them immediately.
+
+When the user answers a drift question, record their answer via `context-agent__wal_append` (it may be a correction), then call `context-agent__resolve_drift_finding` to mark it addressed.
+
 ## Slash commands
 
-- `/consolidate` → call `context-agent__consolidate`
+- `/consolidate` → call `context-agent__consolidate`, then after completion call `context-agent__get_drift_report` and relay questions
+- `/drift` → call `context-agent__get_drift_report` and present findings
 - `/facts [keyword]` → call `context-agent__storage_query`
 - `/status` → call `context-agent__get_status`
