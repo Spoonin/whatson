@@ -208,6 +208,41 @@ describe("drift analysis", () => {
       expect(hashFact(fa)).not.toBe(hashFact(fc));
     });
 
+    it("deduplicates findings for same fact and verdict", async () => {
+      const { insertDriftFinding } = await import("./storage.js");
+      const factId = await insertFact(makeFact({ source_type: "decision", confidence: "high" }));
+
+      const id1 = await insertDriftFinding({
+        run_at: "2026-04-12T10:00:00Z",
+        fact_id: factId,
+        consistent: false,
+        evidence: "missing from codebase",
+        question: "Is it implemented?",
+      });
+      // Same fact, same verdict → should return existing id, not create new row
+      const id2 = await insertDriftFinding({
+        run_at: "2026-04-13T10:00:00Z",
+        fact_id: factId,
+        consistent: false,
+        evidence: "still missing",
+        question: "Is it implemented now?",
+      });
+      expect(id2).toBe(id1);
+
+      const questions = await getUnansweredQuestions();
+      expect(questions).toHaveLength(1);
+
+      // Different verdict → should create new row
+      const id3 = await insertDriftFinding({
+        run_at: "2026-04-13T10:00:00Z",
+        fact_id: factId,
+        consistent: true,
+        evidence: "found it",
+        question: null,
+      });
+      expect(id3).not.toBe(id1);
+    });
+
     it("returns unanswered questions", async () => {
       const { insertDriftFinding } = await import("./storage.js");
       const factId = await insertFact(makeFact({ source_type: "decision", confidence: "high" }));

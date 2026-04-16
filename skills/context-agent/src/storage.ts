@@ -591,6 +591,23 @@ export async function insertDriftFinding(
   finding: Omit<DriftFinding, "id" | "addressed" | "addressed_at">
 ): Promise<number> {
   const db = await getDb();
+
+  // Dedup: skip if an unanswered finding for the same fact with the same
+  // consistency verdict already exists. This prevents repeated drift runs
+  // from ballooning the findings table with duplicate questions.
+  const existing = db
+    .prepare(
+      `SELECT id FROM drift_findings
+       WHERE fact_id = @fact_id AND consistent = @consistent AND addressed = 0
+       LIMIT 1`
+    )
+    .get({
+      fact_id: finding.fact_id,
+      consistent: finding.consistent ? 1 : 0,
+    }) as { id: number } | undefined;
+
+  if (existing) return existing.id;
+
   const info = db
     .prepare(
       `INSERT INTO drift_findings (run_at, fact_id, consistent, evidence, question, addressed)
