@@ -1,3 +1,5 @@
+![Whatson banner](media/banner.png)
+
 # Whatson — Configuration Reference
 
 Whatson is a context agent built on OpenClaw. It ingests messages and documents
@@ -136,3 +138,6 @@ Output paths on the host (via the `./data/context-data` bind mount):
 - `./data/context-data/context.db` — SQLite fact store
 - `./data/context-data/rendered/PROJECT.md` — latest synthesized render
 - `./data/context-data/target-repo/` — local clone of the target repository
+
+# License
+MIT License. See [LICENSE](LICENSE).
