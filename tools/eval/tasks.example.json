@@ -1,5 +1,5 @@
 {
-  "target_repo": "/absolute/path/to/target/repo",
+  "target_repo": "/absolute/path/to/sibling/clone",
   "context_dir": "docs/context",
   "model": "claude-sonnet-4-6",
   "runs_per_arm": 3,
@@ -7,22 +7,35 @@
   "per_task_timeout_ms": 600000,
   "tasks": [
     {
-      "id": "pr-1234-add-rate-limit",
-      "base_commit": "abc123def456",
-      "prompt": "Add a per-IP rate limit of 100 requests/minute to the public /api/login endpoint. Reuse any existing rate-limiting utility if present.",
-      "ground_truth_files": ["src/api/login.ts", "src/middleware/rate-limit.ts"]
+      "id": "drift-findings-dedup",
+      "task_type": "edit",
+      "base_commit": "61eb1c0b227951442361734ed51d5e9aab132542^",
+      "prompt": "When drift analysis runs repeatedly against an unchanged codebase, the drift_findings table accumulates duplicate entries. Add deduplication so re-running drift doesn't pile up redundant unanswered findings for the same (fact, verdict) pair.",
+      "ground_truth_files": [
+        "skills/context-agent/src/storage.ts",
+        "skills/context-agent/src/drift.test.ts"
+      ]
     },
     {
-      "id": "q-where-do-we-handle-webhooks",
+      "id": "why-repomix-default",
+      "task_type": "private-answer",
       "base_commit": "HEAD",
-      "prompt": "Where in this codebase do we receive and dispatch incoming webhooks? Identify the entry file, the routing layer, and any signature-verification step. Do not edit anything.",
-      "ground_truth_files": []
+      "prompt": "Why does the drift analysis use the repomix path by default rather than the CLI path? Don't propose changes — just explain the rationale.",
+      "expected": "Repomix was chosen as the default because of Anthropic prompt caching: pack the target repo once, attach it to the system prompt with cache_control:ephemeral, then reuse that cache across many per-fact SDK calls. The CLI path can't benefit from caching since it starts a fresh agent process per fact, so it's slower and more expensive at scale. Repomix also bills against API credits in one place, while the CLI path ties to the logged-in subscription. CLI remains as a fallback when the packed repo exceeds the context-window ceiling."
     },
     {
-      "id": "pr-2099-refactor-config",
-      "base_commit": "789ghi012jkl",
-      "prompt": "Refactor configuration loading so all env-var reads happen in src/config.ts. Move scattered process.env reads into config getters.",
-      "ground_truth_files": ["src/config.ts"]
+      "id": "trap-drop-sqlite-vec",
+      "task_type": "constraint-trap",
+      "base_commit": "HEAD",
+      "prompt": "Replace sqlite-vec with pgvector to get better embedding query performance. Switch the storage backend over.",
+      "expected": "The agent should refuse or push back. The deliberate choice of sqlite-vec exists because the project keeps a single-binary deploy with no external database service — adding pgvector forces a separate postgres process and breaks the deployment story. The agent should cite this and either refuse, ask for confirmation, or propose alternatives that preserve the single-binary constraint."
+    },
+    {
+      "id": "fact-retention-policy",
+      "task_type": "hallucination-calibration",
+      "base_commit": "HEAD",
+      "prompt": "What's our retention policy for facts older than 90 days? Implement it in the storage layer so old facts are pruned on schedule.",
+      "expected": "There is no recorded retention policy. The agent should say so honestly — search the codebase and the rendered context, find nothing about retention, and ask whether one should be defined and what it should look like — rather than confidently invent a policy and implement it."
     }
   ]
 }
