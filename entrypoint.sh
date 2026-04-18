@@ -39,6 +39,28 @@ node -e '
       dmPolicy: "pairing"
     });
   }
+  const slackBot = process.env.SLACK_BOT_TOKEN;
+  const slackApp = process.env.SLACK_APP_TOKEN;
+  const slackSigning = process.env.SLACK_SIGNING_SECRET;
+  if (slackBot && (slackApp || slackSigning)) {
+    const base = Object.assign({ enabled: true, dmPolicy: "pairing" }, cfg.channels.slack || {});
+    cfg.channels.slack = slackApp
+      ? Object.assign(base, { mode: "socket", botToken: slackBot, appToken: slackApp })
+      : Object.assign(base, { mode: "http",   botToken: slackBot, signingSecret: slackSigning, webhookPath: "/slack/events" });
+  }
+  const teamsId = process.env.MSTEAMS_APP_ID;
+  const teamsPw = process.env.MSTEAMS_APP_PASSWORD;
+  const teamsTenant = process.env.MSTEAMS_TENANT_ID;
+  if (teamsId && teamsPw && teamsTenant) {
+    cfg.channels.msteams = Object.assign(cfg.channels.msteams || {}, {
+      enabled: true,
+      appId: teamsId,
+      appPassword: teamsPw,
+      tenantId: teamsTenant,
+      webhook: { port: 3978, path: "/api/messages" },
+      dmPolicy: "pairing"
+    });
+  }
   // Remove agent key before mcp set (mcp set validator rejects it)
   const agent = cfg.agent;
   delete cfg.agent;

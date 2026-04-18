@@ -3,9 +3,10 @@
 # Whatson — Configuration Reference
 
 Whatson is a context agent built on OpenClaw. It ingests messages and documents
-via Telegram, extracts structured facts into a temporal knowledge graph, runs
-consolidation passes to resolve duplicates and contradictions, and exports the
-active knowledge base to a target repository as structured markdown.
+via Telegram, Slack, or Microsoft Teams, extracts structured facts into a
+temporal knowledge graph, runs consolidation passes to resolve duplicates and
+contradictions, and exports the active knowledge base to a target repository
+as structured markdown.
 
 This document lists every environment variable Whatson reads. Copy
 [.env.example](.env.example) to `.env`, fill in required values, then
@@ -19,7 +20,51 @@ This document lists every environment variable Whatson reads. Copy
 |---|---|
 | `ANTHROPIC_API_KEY` | API key for Claude. Used by the SDK backend and, by default, also by the `claude` CLI inside the container. Required unless every LLM component is switched to CLI and the binary is logged into a Pro/Max session. |
 | `OPENCLAW_GATEWAY_TOKEN` | Bearer token protecting the OpenClaw Control UI and HTTP gateway. Pick any long random string. |
-| `TELEGRAM_BOT_TOKEN` | Token from `@BotFather`. Required to connect the Telegram channel. Leave unset to run the gateway without Telegram. |
+| _Channel token_ | At least one channel must be configured — Telegram, Slack, or Microsoft Teams. See [Channels](#channels). |
+
+---
+
+## Channels
+
+The context-agent is channel-agnostic: OpenClaw receives messages on any
+enabled channel, hands them to the MCP server, and the agent stores them with
+the channel name as the `source` prefix. Enable any subset; leave all unset
+to run the gateway without inbound messages.
+
+### Telegram
+
+| Variable | Description |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Token from `@BotFather`. Enables `channels.telegram`. |
+
+### Slack
+
+Choose **socket mode** (simpler, no public URL needed) or **HTTP mode**
+(webhook events). Socket requires an app token; HTTP requires a signing
+secret.
+
+| Variable | Description |
+|---|---|
+| `SLACK_BOT_TOKEN` | `xoxb-…` bot token. Required for either mode. |
+| `SLACK_APP_TOKEN` | `xapp-…` app-level token with `connections:write`. Setting this selects socket mode. |
+| `SLACK_SIGNING_SECRET` | Signing secret from the Slack app's Basic Information page. Setting this (without `SLACK_APP_TOKEN`) selects HTTP mode; events post to `/slack/events`. |
+
+Slack is only enabled when `SLACK_BOT_TOKEN` **and** one of
+`SLACK_APP_TOKEN` / `SLACK_SIGNING_SECRET` are set.
+
+### Microsoft Teams
+
+Requires an Azure Bot registration. All three variables must be set to
+enable `channels.msteams`.
+
+| Variable | Description |
+|---|---|
+| `MSTEAMS_APP_ID` | Microsoft App ID from the Azure Bot Configuration page. |
+| `MSTEAMS_APP_PASSWORD` | Client secret generated under the App Registration → Certificates & secrets. |
+| `MSTEAMS_TENANT_ID` | Directory (tenant) ID from the Azure AD Overview tab. |
+
+Teams uses the Bot Framework webhook on port `3978` at `/api/messages`.
+Expose that port if you need Teams to reach the gateway from outside Docker.
 
 ---
 
