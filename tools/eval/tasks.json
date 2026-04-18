@@ -1,0 +1,19 @@
+{
+  "target_repo": "/Users/loo/repos/whatson-eval",
+  "context_dir": "docs/context",
+  "model": "claude-sonnet-4-6",
+  "runs_per_arm": 3,
+  "max_turns": 30,
+  "per_task_timeout_ms": 600000,
+  "tasks": [
+    {
+      "id": "drift-findings-dedup",
+      "base_commit": "61eb1c0b227951442361734ed51d5e9aab132542^",
+      "prompt": "When drift analysis runs repeatedly against an unchanged codebase, the drift_findings table accumulates duplicate entries — the same fact gets a new finding row on every run, even when the verdict hasn't changed. Add deduplication so re-running drift doesn't pile up redundant unanswered findings for the same (fact, verdict) pair.",
+      "ground_truth_files": [
+        "skills/context-agent/src/storage.ts",
+        "skills/context-agent/src/drift.test.ts"
+      ]
+    } 
+  ]
+}

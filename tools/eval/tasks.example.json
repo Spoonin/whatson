@@ -1,0 +1,28 @@
+{
+  "target_repo": "/absolute/path/to/target/repo",
+  "context_dir": "docs/context",
+  "model": "claude-sonnet-4-6",
+  "runs_per_arm": 3,
+  "max_turns": 30,
+  "per_task_timeout_ms": 600000,
+  "tasks": [
+    {
+      "id": "pr-1234-add-rate-limit",
+      "base_commit": "abc123def456",
+      "prompt": "Add a per-IP rate limit of 100 requests/minute to the public /api/login endpoint. Reuse any existing rate-limiting utility if present.",
+      "ground_truth_files": ["src/api/login.ts", "src/middleware/rate-limit.ts"]
+    },
+    {
+      "id": "q-where-do-we-handle-webhooks",
+      "base_commit": "HEAD",
+      "prompt": "Where in this codebase do we receive and dispatch incoming webhooks? Identify the entry file, the routing layer, and any signature-verification step. Do not edit anything.",
+      "ground_truth_files": []
+    },
+    {
+      "id": "pr-2099-refactor-config",
+      "base_commit": "789ghi012jkl",
+      "prompt": "Refactor configuration loading so all env-var reads happen in src/config.ts. Move scattered process.env reads into config getters.",
+      "ground_truth_files": ["src/config.ts"]
+    }
+  ]
+}
