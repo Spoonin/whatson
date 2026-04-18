@@ -111,7 +111,8 @@ cd /app
 node dist/index.js mcp set context-agent "$MCP_CONFIG_JSON" 2>&1 || echo "[entrypoint] WARNING: mcp set failed (non-fatal)"
 
 # ── Step 3: Set agent model via CLI (after mcp set) ─────────────────────────
-echo "[entrypoint] Setting agent model..."
-node dist/index.js config set agents.defaults.model anthropic/claude-sonnet-4-6 2>&1 || echo "[entrypoint] WARNING: model set failed (non-fatal)"
+AGENT_MODEL="${OPENCLAW_AGENT_MODEL:-anthropic/claude-haiku-4-5}"
+echo "[entrypoint] Setting agent model to $AGENT_MODEL..."
+node dist/index.js config set agents.defaults.model "$AGENT_MODEL" 2>&1 || echo "[entrypoint] WARNING: model set failed (non-fatal)"
 
 exec node dist/index.js gateway "$@"

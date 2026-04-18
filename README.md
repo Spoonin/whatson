@@ -73,6 +73,7 @@ Expose that port if you need Teams to reach the gateway from outside Docker.
 | Variable | Default | Description |
 |---|---|---|
 | `OPENCLAW_GATEWAY_PORT` | `18789` | Host port the Control UI and HTTP gateway bind to. |
+| `OPENCLAW_AGENT_MODEL` | `anthropic/claude-haiku-4-5` | Model used by OpenClaw's native agent — the one that reads inbound channel messages and calls MCP tools. Format: `provider/model`. Haiku is the default for low API cost; switch to `anthropic/claude-sonnet-4-6` or `anthropic/claude-opus-4-7` for stronger reasoning. Distinct from the context-agent's internal LLM calls (see [LLM backend routing](#llm-backend-routing)). |
 
 ---
 
