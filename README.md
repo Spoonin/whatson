@@ -18,7 +18,8 @@ This document lists every environment variable Whatson reads. Copy
 
 | Variable | Description |
 |---|---|
-| `ANTHROPIC_API_KEY` | API key for Claude. Used by the SDK backend and, by default, also by the `claude` CLI inside the container. Required unless every LLM component is switched to CLI and the binary is logged into a Pro/Max session. |
+| _Agent provider key_ | At least one provider key matching `OPENCLAW_AGENT_MODEL` (see [Gateway](#gateway)). The default model is `google/gemini-2.0-flash` → set `GOOGLE_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey) (free tier). Alternatives: `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`. |
+| `ANTHROPIC_API_KEY` | Needed for the context-agent's internal LLM calls (extract, consolidation, render, drift). Distinct from the OpenClaw agent's provider. Unset → those features no-op; inbound message handling still works. |
 | `OPENCLAW_GATEWAY_TOKEN` | Bearer token protecting the OpenClaw Control UI and HTTP gateway. Pick any long random string. |
 | _Channel token_ | At least one channel must be configured — Telegram, Slack, or Microsoft Teams. See [Channels](#channels). |
 
@@ -73,7 +74,10 @@ Expose that port if you need Teams to reach the gateway from outside Docker.
 | Variable | Default | Description |
 |---|---|---|
 | `OPENCLAW_GATEWAY_PORT` | `18789` | Host port the Control UI and HTTP gateway bind to. |
-| `OPENCLAW_AGENT_MODEL` | `anthropic/claude-haiku-4-5` | Model used by OpenClaw's native agent — the one that reads inbound channel messages and calls MCP tools. Format: `provider/model`. Haiku is the default for low API cost; switch to `anthropic/claude-sonnet-4-6` or `anthropic/claude-opus-4-7` for stronger reasoning. Distinct from the context-agent's internal LLM calls (see [LLM backend routing](#llm-backend-routing)). |
+| `OPENCLAW_AGENT_MODEL` | `google/gemini-2.0-flash` | Model used by OpenClaw's native agent — the one that reads inbound channel messages and calls MCP tools. Format: `provider/model`. Default uses Google's free tier (set `GOOGLE_API_KEY`). Alternatives: `anthropic/claude-haiku-4-5` (+ `ANTHROPIC_API_KEY`), `groq/llama-3.3-70b-versatile` (+ `GROQ_API_KEY`), `openrouter/google/gemma-2-9b-it:free` (+ `OPENROUTER_API_KEY`). Distinct from the context-agent's internal LLM calls (see [LLM backend routing](#llm-backend-routing)). |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | _(unset)_ | Google AI Studio key. Required when `OPENCLAW_AGENT_MODEL` uses `google/…`. Free tier is generous enough for dev ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)). |
+| `GROQ_API_KEY` | _(unset)_ | Groq Cloud key. Required when `OPENCLAW_AGENT_MODEL` uses `groq/…`. Free tier hosts Llama, Qwen, Gemma with very fast inference. |
+| `OPENROUTER_API_KEY` | _(unset)_ | OpenRouter key. Required when `OPENCLAW_AGENT_MODEL` uses `openrouter/…`. Rate-limited free models available (tagged `:free`). |
 
 ---
 

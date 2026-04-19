@@ -74,6 +74,10 @@ MCP_CONFIG_JSON=$(node -e '
   const env = {};
   const keys = [
     "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GROQ_API_KEY",
+    "OPENROUTER_API_KEY",
     "TARGET_REPO",
     "WHATSON_CONTEXT_DIR",
     "WHATSON_TARGET_WORKDIR",
@@ -111,7 +115,7 @@ cd /app
 node dist/index.js mcp set context-agent "$MCP_CONFIG_JSON" 2>&1 || echo "[entrypoint] WARNING: mcp set failed (non-fatal)"
 
 # ── Step 3: Set agent model via CLI (after mcp set) ─────────────────────────
-AGENT_MODEL="${OPENCLAW_AGENT_MODEL:-anthropic/claude-haiku-4-5}"
+AGENT_MODEL="${OPENCLAW_AGENT_MODEL:-google/gemini-2.0-flash}"
 echo "[entrypoint] Setting agent model to $AGENT_MODEL..."
 node dist/index.js config set agents.defaults.model "$AGENT_MODEL" 2>&1 || echo "[entrypoint] WARNING: model set failed (non-fatal)"
 
