@@ -143,7 +143,7 @@ export async function _setDbForTest(db?: DB): Promise<DB> {
 // Single-shot schema creation. Bump SCHEMA_VERSION to nuke and recreate.
 // Safe while all data is test data; swap to proper migrations for production.
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 function migrate(db: DB): void {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -221,6 +221,7 @@ function migrate(db: DB): void {
       FOREIGN KEY (fact_id)         REFERENCES facts(id),
       FOREIGN KEY (related_fact_id) REFERENCES facts(id)
     );
+    CREATE INDEX idx_fact_relations_fact_id ON fact_relations(fact_id);
 
     CREATE TABLE consolidation_log (
       id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -516,6 +517,30 @@ export async function insertRelation(rel: FactRelation): Promise<void> {
     `INSERT INTO fact_relations (fact_id, related_fact_id, relation_type, created_at)
      VALUES (@fact_id, @related_fact_id, @relation_type, @created_at)`
   ).run({ ...rel, created_at: new Date().toISOString() });
+}
+
+export async function getFactRelations(
+  factIds: number[]
+): Promise<Map<number, Array<{ relatedFactId: number; relationType: RelationType }>>> {
+  if (factIds.length === 0) return new Map();
+
+  const db = await getDb();
+  const placeholders = factIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT fact_id, related_fact_id, relation_type FROM fact_relations WHERE fact_id IN (${placeholders})`)
+    .all(...factIds) as Array<{ fact_id: number; related_fact_id: number; relation_type: RelationType }>;
+
+  const map = new Map<number, Array<{ relatedFactId: number; relationType: RelationType }>>();
+  for (const row of rows) {
+    if (!map.has(row.fact_id)) {
+      map.set(row.fact_id, []);
+    }
+    map.get(row.fact_id)!.push({
+      relatedFactId: row.related_fact_id,
+      relationType: row.relation_type,
+    });
+  }
+  return map;
 }
 
 // ── Consolidation log ─────────────────────────────────────────────────────────

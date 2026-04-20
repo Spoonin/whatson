@@ -23,8 +23,8 @@ import {
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
 import {
   renderProjectDoc, renderArchitectureDoc, renderDecisionsDoc,
-  renderQuestionsDoc, renderRequirementsDoc, renderStatusDoc, renderAll,
-  type RenderResult, type RenderOptions,
+  renderQuestionsDoc, renderRequirementsDoc, renderStatusDoc, renderAll, renderTreeDoc,
+  type RenderResult, type RenderOptions, type TreeRenderOptions,
 } from "./render.js";
 import { retrieve, getStatus, type RetrievalResult } from "./retrieval.js";
 import { embedText } from "./embeddings.js";
@@ -346,6 +346,10 @@ export async function render_status(args: RenderOptions = {}): Promise<RenderRes
 
 export async function render_all(args: RenderOptions = {}): Promise<RenderResult[]> {
   return renderAll(args);
+}
+
+export async function render_tree(args: TreeRenderOptions = {}): Promise<RenderResult> {
+  return renderTreeDoc(args);
 }
 
 // ── Tool: get_status ──────────────────────────────────────────────────────────

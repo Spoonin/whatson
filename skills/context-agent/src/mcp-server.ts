@@ -10,7 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { wal_append, storage_insert, storage_query, consolidate_start, consolidate_status, sync_repo, get_status, retrieve_context, run_drift_analysis, get_drift_report, resolve_drift_finding } from "./index.js";
+import { wal_append, storage_insert, storage_query, consolidate_start, consolidate_status, sync_repo, get_status, retrieve_context, run_drift_analysis, get_drift_report, resolve_drift_finding, render_tree } from "./index.js";
 import { backfillEmbeddings } from "./embeddings.js";
 
 const server = new McpServer({
@@ -243,6 +243,23 @@ server.tool(
     const result = await resolve_drift_finding({ finding_id: params.finding_id });
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    };
+  }
+);
+
+// ── Tool: render_tree ───────────────────────────────────────────────────────
+
+server.tool(
+  "render_tree",
+  "Generate TREE.md: a mechanical structural overview of the knowledge base grouped by tag hierarchy, with inline relation edges, contradictions, open questions, and sources. Fast and deterministic. Call when you want a bird's-eye map of everything stored.",
+  {},
+  async () => {
+    const result = await render_tree();
+    const msg = result.skipped
+      ? `TREE.md skipped: ${result.skipped}`
+      : `TREE.md rendered: ${result.factCount} facts → ${result.outputPath}`;
+    return {
+      content: [{ type: "text", text: msg }],
     };
   }
 );

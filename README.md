@@ -153,11 +153,30 @@ when the API key is absent.
 
 ---
 
-## Drift analysis
+## Consolidation pipeline
 
-Drift analysis cross-checks recorded facts against the current state of the
-target repo's code. It runs as phase 5 of consolidation and shells out to the
-`claude` CLI with tool access.
+Whatson's consolidation runs in 6 phases, triggered daily at 03:00 UTC or manually
+via `/consolidate`. Phases 5–6 run in the background and signal findings via heartbeat.
+
+| Phase | Name | What it does |
+|---|---|---|
+| 1 | **Orient** | Count facts, detect topics, orient to the current state. |
+| 2 | **Gather Signal** | Extract keywords from all active facts for clustering. |
+| 3 | **Consolidate** | Merge duplicates, detect contradictions, build relations. |
+| 4 | **Prune & Index** | Expire stale low-confidence facts, rebuild `INDEX.md`. |
+| 5 | **Drift Analysis** | *(Optional, background)* Cross-check facts against target repo code. |
+| 6 | **Audit Pass** | *(Optional, background)* Self-reflection: ask LLM what gaps/contradictions we missed. |
+
+Phases 5–6 are background tasks: they finish independently and write findings to
+`HEARTBEAT.md`. The OpenClaw agent reads the heartbeat on its next poll and relays
+findings to the user immediately.
+
+---
+
+## Drift analysis (Phase 5)
+
+Cross-checks recorded facts against the current state of target repo code.
+Runs in the background via the `claude` CLI with tool access (Grep, Bash, etc.).
 
 | Variable | Default | Description |
 |---|---|---|
@@ -166,6 +185,19 @@ target repo's code. It runs as phase 5 of consolidation and shells out to the
 
 Drift also requires `TARGET_REPO` to be set and a successful checkout — without
 a target repo there's nothing to check against.
+
+---
+
+## Audit pass (Phase 6)
+
+Self-reflection on recent facts. The LLM introspects: *Did I miss gaps?
+Contradictions? Follow-up questions?* Results are stored as question-type facts
+(source: `audit:self-reflection`) and merged into heartbeat findings alongside drift.
+
+| Variable | Default | Description |
+|---|---|---|
+| `WHATSON_AUDIT_ENABLED` | `false` | Enable self-reflection on facts after each consolidation. Generates question-type facts for gaps and follow-ups. |
+| `WHATSON_AUDIT_LOOKBACK` | `50` | Number of recent facts to audit per run. Smaller = faster, less comprehensive. |
 
 ---
 

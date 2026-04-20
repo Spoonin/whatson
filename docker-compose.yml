@@ -32,6 +32,8 @@ services:
       WHATSON_DRIFT_MAX_PACK_BYTES: "${WHATSON_DRIFT_MAX_PACK_BYTES:-3000000}"
       WHATSON_DRIFT_CONCURRENCY: "${WHATSON_DRIFT_CONCURRENCY:-4}"
       WHATSON_DRIFT_DRY_RUN: "${WHATSON_DRIFT_DRY_RUN:-}"
+      WHATSON_AUDIT_ENABLED: "${WHATSON_AUDIT_ENABLED:-false}"
+      WHATSON_AUDIT_LOOKBACK: "${WHATSON_AUDIT_LOOKBACK:-50}"
       # LLM backend switch: "sdk" (api.anthropic.com, billed API credits)
       # or "cli" (`claude -p`, billed against a logged-in Pro/Max session).
       # Per-component overrides take precedence over the global default.

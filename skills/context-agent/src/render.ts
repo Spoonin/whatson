@@ -15,7 +15,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getActiveFacts, type Fact } from "./storage.js";
+import { getActiveFacts, getFactRelations, getDriftFindings, type Fact, type DriftFinding, type RelationType } from "./storage.js";
 import { callModel, isBackendReady, resolveBackend, type LlmBackend } from "./llm.js";
 import { syncRenderedFile, type RepoSyncResult } from "./repo-sync.js";
 
@@ -76,6 +76,10 @@ export interface RenderOptions {
   templateName?: string;
   tags?: string[];
   sourceTypes?: string[];
+}
+
+export interface TreeRenderOptions {
+  outputDir?: string;
 }
 
 // ── Fact filter (pure) ──────────────────────────────────────────────────────
@@ -340,6 +344,226 @@ export async function renderStatusDoc(opts: RenderOptions = {}): Promise<RenderR
   return renderArtifact(STATUS_CONFIG, opts);
 }
 
+// ── Tree Renderer ────────────────────────────────────────────────────────────
+// Mechanical renderer (no LLM). Groups facts by tag hierarchy, shows relation
+// edges inline, surfaces contradictions and open questions.
+
+function groupFactsByTag(facts: Fact[]): Map<string, Map<string, Fact[]>> {
+  const groups = new Map<string, Map<string, Fact[]>>();
+
+  for (const f of facts) {
+    const primary = f.tags[0] ?? "untagged";
+    const secondary = f.tags[1] ?? "_root";
+
+    if (!groups.has(primary)) {
+      groups.set(primary, new Map());
+    }
+    const secondary_map = groups.get(primary)!;
+    if (!secondary_map.has(secondary)) {
+      secondary_map.set(secondary, []);
+    }
+    secondary_map.get(secondary)!.push(f);
+  }
+
+  const sorted = new Map<string, Map<string, Fact[]>>();
+  const primaryKeys = Array.from(groups.keys()).sort((a, b) => {
+    if (a === "untagged") return 1;
+    if (b === "untagged") return -1;
+    return a.localeCompare(b);
+  });
+
+  for (const primary of primaryKeys) {
+    const secondaryMap = groups.get(primary)!;
+    const sorted_secondary = new Map<string, Fact[]>();
+    const secondaryKeys = Array.from(secondaryMap.keys()).sort((a, b) => {
+      if (a === "_root") return -1;
+      if (b === "_root") return 1;
+      return a.localeCompare(b);
+    });
+    for (const secondary of secondaryKeys) {
+      sorted_secondary.set(secondary, secondaryMap.get(secondary)!);
+    }
+    sorted.set(primary, sorted_secondary);
+  }
+
+  return sorted;
+}
+
+function formatFactLine(
+  fact: Fact,
+  relations: Array<{ relatedFactId: number; relationType: RelationType }> | undefined,
+  factIndex: Map<number, Fact>
+): string {
+  const content = fact.content.length > 80 ? fact.content.slice(0, 80) + "…" : fact.content;
+  let line = `- [f:${fact.id}] **${content}** \`${fact.confidence}\` *${fact.source}*`;
+
+  if (relations && relations.length > 0) {
+    for (const edge of relations) {
+      if (factIndex.has(edge.relatedFactId)) {
+        line += `\n  - ${edge.relationType} → [f:${edge.relatedFactId}]`;
+      }
+    }
+  }
+
+  return line;
+}
+
+function formatContradictions(
+  all: Fact[],
+  relationsMap: Map<number, Array<{ relatedFactId: number; relationType: RelationType }>>,
+  driftFindings: DriftFinding[]
+): string {
+  const lines: string[] = [];
+  const emitted = new Set<string>();
+
+  // From relations
+  for (const [factId, edges] of relationsMap) {
+    for (const edge of edges) {
+      if (edge.relationType === "contradicts") {
+        const pair = `${Math.min(factId, edge.relatedFactId)},${Math.max(factId, edge.relatedFactId)}`;
+        if (!emitted.has(pair)) {
+          emitted.add(pair);
+          const factA = all.find((f) => f.id === factId);
+          const factB = all.find((f) => f.id === edge.relatedFactId);
+          if (factA && factB) {
+            const contentA = factA.content.length > 60 ? factA.content.slice(0, 60) + "…" : factA.content;
+            const contentB = factB.content.length > 60 ? factB.content.slice(0, 60) + "…" : factB.content;
+            lines.push(`- [f:${factA.id}] "${contentA}" ←contradicts→ [f:${factB.id}] "${contentB}"`);
+          }
+        }
+      }
+    }
+  }
+
+  // From drift
+  for (const finding of driftFindings) {
+    if (!finding.consistent && !finding.addressed) {
+      const fact = all.find((f) => f.id === finding.fact_id);
+      if (fact) {
+        const content = fact.content.length > 60 ? fact.content.slice(0, 60) + "…" : fact.content;
+        const evidence = finding.evidence || "inconsistency detected";
+        lines.push(`- [f:${fact.id}] "${content}" *(drift: ${evidence})*`);
+      }
+    }
+  }
+
+  return lines.length > 0 ? lines.join("\n") : "";
+}
+
+function formatOpenQuestions(facts: Fact[]): string {
+  const questions = facts.filter((f) => f.source_type === "question");
+  if (questions.length === 0) return "";
+
+  return questions
+    .map((q) => `- [f:q:${q.id}] ${q.content} *(${q.source})*)`)
+    .join("\n");
+}
+
+function buildSourcesFooter(facts: Fact[]): string {
+  const sourceMap = new Map<string, number>();
+  for (const f of facts) {
+    sourceMap.set(f.source, (sourceMap.get(f.source) ?? 0) + 1);
+  }
+
+  const sorted = Array.from(sourceMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([source, count]) => `- \`${source}\` — ${count} fact${count === 1 ? "" : "s"}`);
+
+  return sorted.join("\n");
+}
+
+export async function renderTreeDoc(opts: TreeRenderOptions = {}): Promise<RenderResult> {
+  const outputDir = opts.outputDir ?? DEFAULT_OUTPUT_DIR;
+  const all = await getActiveFacts();
+
+  if (all.length === 0) {
+    return {
+      artifact: "TREE.md",
+      factCount: 0,
+      verified: false,
+      violations: [],
+      skipped: "no active facts in fact store",
+    };
+  }
+
+  const relationsMap = await getFactRelations(all.map((f) => f.id!));
+  const driftFindings = await getDriftFindings();
+
+  // Build fact index for quick lookup
+  const factIndex = new Map(all.map((f) => [f.id!, f]));
+
+  // Group by tag hierarchy
+  const grouped = groupFactsByTag(all);
+
+  // Render tag sections
+  const sections: string[] = [];
+  for (const [primary, secondaryMap] of grouped) {
+    const primaryCount = Array.from(secondaryMap.values()).reduce((sum, arr) => sum + arr.length, 0);
+    sections.push(`## ${primary} (${primaryCount})`);
+
+    for (const [secondary, facts] of secondaryMap) {
+      if (secondary !== "_root") {
+        sections.push(`### ${secondary} (${facts.length})`);
+      }
+
+      for (const fact of facts) {
+        const edges = relationsMap.get(fact.id!);
+        sections.push(formatFactLine(fact, edges, factIndex));
+      }
+    }
+  }
+
+  // Build contradictions section
+  const contradictions = formatContradictions(all, relationsMap, driftFindings);
+  const contraSection = contradictions ? [`---`, `\n## ⚠️ Contradictions`, contradictions] : [];
+
+  // Build open questions section
+  const questions = formatOpenQuestions(all);
+  const questionsSection = questions ? [`\n## ⚠️ Open Questions`, questions] : [];
+
+  // Build sources footer
+  const sourcesFooter = buildSourcesFooter(all);
+  const sourcesSection = [`\n---\n## Sources`, sourcesFooter];
+
+  // Assemble document
+  const now = new Date().toISOString().slice(0, 10);
+  const relCount = relationsMap.size > 0
+    ? Array.from(relationsMap.values()).reduce((sum, arr) => sum + arr.length, 0)
+    : 0;
+
+  const output = [
+    `# Knowledge Tree`,
+    `> Generated by Whatson • ${now} • ${all.length} active facts • ${relCount} relations`,
+    ``,
+    ...sections,
+    ...contraSection,
+    ...questionsSection,
+    ...sourcesSection,
+  ].join("\n");
+
+  // Write file
+  fs.mkdirSync(outputDir, { recursive: true });
+  const outputPath = path.join(outputDir, "TREE.md");
+  fs.writeFileSync(outputPath, output, "utf-8");
+
+  // Sync to repo
+  const sync = await syncRenderedFile(outputPath, "TREE.md");
+
+  return {
+    artifact: "TREE.md",
+    factCount: all.length,
+    verified: true,
+    violations: [],
+    outputPath,
+    gitPush: {
+      committed: sync.committed,
+      pushed: sync.pushed,
+      commitSha: sync.commitSha,
+      skipped: sync.skipped,
+    },
+  };
+}
+
 export async function renderAll(opts: RenderOptions = {}): Promise<RenderResult[]> {
   return Promise.all([
     renderProjectDoc(opts),
@@ -348,5 +572,6 @@ export async function renderAll(opts: RenderOptions = {}): Promise<RenderResult[
     renderQuestionsDoc(opts),
     renderRequirementsDoc(opts),
     renderStatusDoc(opts),
+    renderTreeDoc(opts),
   ]);
 }

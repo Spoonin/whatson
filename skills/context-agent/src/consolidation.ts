@@ -1,8 +1,9 @@
 /**
- * Module 3: Consolidation Loop — 5-phase pipeline
+ * Module 3: Consolidation Loop — 6-phase pipeline
  *
- * Phases: Orient → Gather Signal → Consolidate → Prune & Index → Drift Analysis
+ * Phases: Orient → Gather Signal → Consolidate → Prune & Index → Drift Analysis → Audit Pass
  * Triggered by cron (daily 03:00) or manually via /consolidate.
+ * Phases 5–6 run in background; findings are relayed via heartbeat.
  */
 
 import fs from "fs";
@@ -24,6 +25,7 @@ import {
 } from "./storage.js";
 import { syncToTargetRepo, type RepoSyncResult } from "./repo-sync.js";
 import { runDriftAnalysis, formatDriftSummary, type DriftAnalysisResult } from "./drift.js";
+import { insertFact, type DriftFinding } from "./storage.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, "../data");
@@ -66,6 +68,75 @@ export function clearDriftHeartbeatFlag(): void {
   } catch {
     // ignore — file may not exist
   }
+}
+
+// ── Phase 6: Audit Pass — self-reflection on facts ────────────────────────
+// Optional phase that asks the LLM: given recent facts, what gaps or questions
+// did I miss? Gated by WHATSON_AUDIT_ENABLED. Results are stored as question-type
+// facts and merged into the heartbeat alongside drift findings.
+
+export interface AuditResult {
+  questionsGenerated: number;
+  lookback: number;
+}
+
+async function runAuditPass(): Promise<AuditResult> {
+  const enabled = process.env.WHATSON_AUDIT_ENABLED?.toLowerCase() === "true";
+  if (!enabled) return { questionsGenerated: 0, lookback: 0 };
+
+  const lookback = parseInt(process.env.WHATSON_AUDIT_LOOKBACK || "50", 10);
+  const facts = await getActiveFacts();
+  const recent = facts.slice(0, lookback);
+
+  if (recent.length === 0) return { questionsGenerated: 0, lookback };
+
+  const factsSummary = recent
+    .map((f) => `- [${f.source_type}] ${f.content.slice(0, 100)}`)
+    .join("\n");
+
+  const prompt = `You are a knowledge auditor. Given these recent facts stored in our knowledge base, identify:
+1. Questions or gaps we should explore further
+2. Contradictions or ambiguities that need clarification
+3. Sources or topics we might have missed
+4. Follow-up investigations to strengthen our understanding
+
+Recent facts (${recent.length} most recent):
+${factsSummary}
+
+For each gap, generate a concise question that the team should investigate. Format each on a new line as: "Q: <question>"`;
+
+  const response = await callModel({
+    component: "consolidation",
+    user: prompt,
+    system: "You are a knowledge auditor helping identify gaps in our fact base.",
+    model: "claude-haiku-4-5-20251001",
+  });
+
+  const lines = response.text.split("\n").filter((l) => l.startsWith("Q: "));
+  let count = 0;
+
+  for (const line of lines) {
+    const questionText = line.slice(3).trim();
+    if (questionText.length > 0) {
+      await insertFact({
+        content: questionText,
+        source: "audit:self-reflection",
+        source_type: "question",
+        confidence: "medium",
+        valid_from: new Date().toISOString(),
+        valid_to: null,
+        superseded_by: null,
+        tags: ["audit", "self-reflection"],
+        raw_message: null,
+        message_id: null,
+        source_url: null,
+        source_file: null,
+      });
+      count++;
+    }
+  }
+
+  return { questionsGenerated: count, lookback };
 }
 
 // ── Background state (for detached consolidate) ────────────────────────────
@@ -787,10 +858,10 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
     notes: repoSync ? JSON.stringify(repoSync) : null,
   });
 
-  // Phase 5: Drift Analysis — fire-and-forget. Runs in background so
-  // consolidation can return quickly. When drift finishes with questions,
-  // it writes a flag to HEARTBEAT.md so the agent picks them up on the
-  // next heartbeat poll and relays them to the user.
+  // Phase 5: Drift Analysis — fire-and-forget.
+  // Phase 6: Audit Pass — self-reflection on facts.
+  // Both run in background. When done, write a heartbeat flag so the agent picks
+  // them up on the next poll and relays findings to the user.
   const driftAnalysis: { skipped: string } = { skipped: "running in background" };
   const t5 = Date.now();
   runDriftAnalysis()
@@ -805,9 +876,33 @@ export async function runConsolidation(): Promise<ConsolidationSummary> {
         duration_ms: Date.now() - t5,
         notes: JSON.stringify(result),
       });
-      // Signal the heartbeat if there are unanswered questions
-      if ("inconsistencies" in result && result.inconsistencies > 0) {
-        writeDriftHeartbeatFlag(result.inconsistencies, result.questionsGenerated);
+
+      // Phase 6: Audit Pass (after drift finishes)
+      const t6 = Date.now();
+      let auditResult: AuditResult = { questionsGenerated: 0, lookback: 0 };
+      try {
+        auditResult = await runAuditPass();
+        await logConsolidationPhase({
+          run_at: runAt,
+          phase: "audit",
+          facts_processed: auditResult.lookback,
+          facts_merged: 0,
+          facts_invalidated: 0,
+          contradictions_found: 0,
+          duration_ms: Date.now() - t6,
+          notes: JSON.stringify(auditResult),
+        });
+      } catch (e) {
+        const err = e instanceof Error ? e.message : String(e);
+        console.error("[audit-bg]", err);
+      }
+
+      // Signal the heartbeat if there are findings from drift or audit
+      const driftQuestions = "inconsistencies" in result ? result.questionsGenerated : 0;
+      const totalQuestions = driftQuestions + auditResult.questionsGenerated;
+      const driftInconsistencies = "inconsistencies" in result ? result.inconsistencies : 0;
+      if (driftInconsistencies > 0 || totalQuestions > 0) {
+        writeDriftHeartbeatFlag(driftInconsistencies, totalQuestions);
       }
     })
     .catch(async (e) => {
